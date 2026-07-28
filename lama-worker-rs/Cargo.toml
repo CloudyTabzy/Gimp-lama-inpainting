@@ -1,0 +1,73 @@
+[package]
+name = "lama-worker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "LaMa inpainting sidecar for the GIMP Native plug-in (Rust CPU)"
+
+# This binary is the optional Rust sidecar for the GIMP Native plug-in.
+# The Python `lama_worker.py` remains the default; the Rust worker is
+# opt-in via `LAMA_USE_RUST_WORKER=1` or `"worker_kind": "rust"` in
+# `lama_config.json`. CPU-only build; GPU features are opt-in at build
+# time (see [features] below).
+
+[dependencies]
+# `ort` is consumed from the external checkout at `../../ort-2.0.0-rc.12`
+# (the workspace root, sibling of `Gimp-lama-inpainting/`). This
+# keeps the upstream ORT crate out of the git repo.
+#
+# Why pinned to rc.12 and not the latest `ort-main`: the rc.12 release
+# ships prebuilt ORT 1.24.2 binaries, which are compiled against MSVC STL
+# versions that match the current toolchain. The `ort-main` branch
+# ships newer prebuilts (1.28.0) referencing newer vectorized STL
+# symbols (`__std_max_element_8i` etc.) that don't exist in older
+# toolchains, causing link failures. rc.12 is the highest version that
+# builds cleanly with the WebGPU feature enabled.
+#
+# `download-binaries` is the standard Rust build path for `ort` and is
+# what the in-tree `examples/*` use. It pulls a prebuilt
+# `onnxruntime` shared library at build time so the linker can find
+# `OrtGetApiBase`. `copy-dylibs` places that dylib next to the
+# produced binary so the GIMP parent can launch the worker without
+# extra `PATH` configuration.
+ort = { path = "../../ort-2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "ndarray",
+    "copy-dylibs",
+    "download-binaries",
+    "tls-native",
+] }
+
+# PNG I/O (Pillow equivalent)
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Numpy equivalent
+ndarray = { version = "0.17", default-features = false }
+
+# CLI parsing
+clap = { version = "4", default-features = false, features = ["std", "derive", "help"] }
+
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "env-filter",
+    "fmt",
+    "registry",
+] }
+
+# Parallel image processing. The CPU inference path parallelizes
+# per-pixel preprocessing (RGBA -> f32, reflect-pad, resize) and
+# postprocessing (mask composition, output write) across all cores.
+rayon = "1.10"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Opt-in GPU execution-provider features. Off by default; the default
+# build is CPU-only. DirectML works on any DX12 GPU; CUDA needs NVIDIA;
+# WebGPU uses Dawn natively on Windows (DX12) / Linux (Vulkan).
+[features]
+default = []
+cuda = ["ort/cuda"]
+directml = ["ort/directml"]
+webgpu = ["ort/webgpu"]
