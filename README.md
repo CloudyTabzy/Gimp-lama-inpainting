@@ -231,8 +231,31 @@ Gimp-lama-inpainting/
 ```
 
 The `lama_fp32.onnx` model (~198 MB) is **not** in the repo. See
-[Model](#model) above — `install.bat` downloads it from HuggingFace
-on first run.
+[Model](#model) above — `install.bat` downloads it from the GitHub
+Releases page on first run.
+
+### Why two `lama-inpaint` Python files?
+
+| File | Role | Runs in |
+|---|---|---|
+| `lama-inpaint.py` | **GIMP plug-in entry** — GIMP discovers it by name, registers `plug-in-lama-inpaint`, handles the UI dialog, exports the drawable + selection as PNGs via GEGL, spawns the worker, reads the result back. Never imports `numpy` or `onnxruntime`. | GIMP's MINGW Python 3.14 |
+| `lama_inpaint.py` | **Inference core** — `LamaInpainter` class with the full pipeline (preprocessing, ONNX inference, soft-mask compositing). The worker subprocess (`lama_worker.py`) imports this module. The underscore makes it a valid Python import name (hyphens aren't). | Worker Python 3.10+ |
+
+The separation is deliberate: the GIMP side stays simple (gi + GEGL only,
+no ML dependencies), and the heavy lifting happens in a separate process
+where we control the runtime.
+
+### What's special about the ONNX model?
+
+The shipped `lama_fp32.onnx` is **not** the original fixed-512×512 export
+from Carve/LaMa-ONNX. We patched the ONNX input dimensions to be
+**dynamic** (height/width set as free dim_params). The FFC generator
+(LaMa's backbone) is fully convolutional, so it accepts any spatial size
+that is a multiple of 16 — and we run at native resolution, not a
+squashed 512². The original fixed export would force every selection
+region through a downscale→upscale round-trip, causing visible blur
+and geometric warp. If you download the model from HuggingFace directly,
+you get the fixed-512 version; ours is the one you want.
 
 ---
 
