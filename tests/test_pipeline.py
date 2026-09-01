@@ -27,11 +27,8 @@ from lama_inpaint import LamaInpainter, MODEL_INPUT_SIZE  # noqa: E402
 def find_model_path() -> Path:
     """Locate the ONNX model, searching standard locations."""
     candidates = [
-        ROOT / "lama-inpainting-py" / "lama_fp32_dynamic.onnx",
         ROOT / "lama-inpainting-py" / "lama_fp32.onnx",
-        ROOT / "lama-worker-rs" / ".." / "lama-inpainting-py" / "lama_fp32_dynamic.onnx",
         ROOT / "lama-worker-rs" / ".." / "lama-inpainting-py" / "lama_fp32.onnx",
-        Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32_dynamic.onnx",
         Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32.onnx",
     ]
     for p in candidates:

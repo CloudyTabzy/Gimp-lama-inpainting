@@ -85,7 +85,10 @@ def _run_inpaint(args: argparse.Namespace) -> None:
         raise ValueError("image dimensions must be nonzero")
 
     image_rgb = rgba[:, :, :3].astype(np.float32) / 255.0
-    mask = (mask_u8 > 127).astype(np.float32)
+    # Keep the mask SOFT (0..1). The model gets a binarized copy inside
+    # inpaint(), and the soft values drive the final composite so
+    # antialiased selection edges blend seamlessly.
+    mask = mask_u8.astype(np.float32) / 255.0
 
     _marker("phase", "inference_start")
     result_rgb = LamaInpainter(model_path).inpaint(image_rgb, mask)

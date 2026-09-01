@@ -679,7 +679,55 @@ The ONNX branch still resizes (fixed-size export).
 
 ---
 
-## 16. See also
+## 17. Native-resolution ONNX + soft-mask compositing (2026-09)
+
+The 512²-squash ONNX path produced visibly blurry, warped inpaints.
+Three root causes, all fixed:
+
+1. **Fixed 512×512 export.** The shipped `lama_fp32.onnx` had static
+   H/W. Any ROI was force-squashed to a 512² square: blur from the
+   downscale→upscale round-trip, warp from anisotropic stretch of
+   non-square ROIs. The FFC generator is fully convolutional, so the
+   fix was to patch the ONNX input dims to dynamic (`height`/`width`
+   dim_params) — no re-export from a checkpoint needed. The dynamic
+   file is now the canonical `lama_fp32.onnx` (the fixed-512 export
+   is gone). Constraint discovered empirically: **spatial dims must be
+   multiples of 16**, not 8 — the /8 bottleneck must stay *even* for
+   the onesided spectral inverse (520 fails, 512 works; 264 fails,
+   256 works). We pad to mod-16, minimum 32.
+
+2. **Resize alignment bug.** `resize_bilinear_hwc` used
+   `src = dst * (src/dst)` (align_corners=True-style) while claiming
+   OpenCV parity. OpenCV/PyTorch `align_corners=False` sample at
+   `(dst + 0.5) * scale - 0.5`. The half-pixel shift was applied
+   twice (down then up) → systematic warp on lines/edges. Both
+   bilinear and nearest resize now use half-pixel-center mapping.
+
+3. **Hard binary composite on antialiased masks.** GIMP selections
+   are soft (0–255). The Python worker binarized at `>127` *before*
+   `inpaint()`, destroying edge softness; both workers then did a
+   hard binary paste → visible seam/color cut. Now: the model input
+   mask is binarized at `> 0` (reference behavior), but compositing
+   blends with the **soft** mask (`a*out + (1-a)*orig`). Pixels at
+   a=0 stay bit-exact original; antialiased edges blend gradually.
+
+**Full-image path.** Reference LaMa runs the *whole* frame through
+the model (the FFC global branch wants full context for consistent
+color/shading). Images ≤ 4 MP (ORT) / ≤ 1 MP (candle, O(N²) DFT
+matmul) now skip the ROI crop entirely: pad full frame to mod-16,
+one inference at native res, soft composite. A 1131×1600 photo takes
+this path with zero resize. Above the budget the ROI path remains,
+with the cap raised to 2048 px and edge-replicate crop padding in
+both workers (Rust was reflect, Python was edge — now both edge;
+mirror padding made the model copy symmetric structures into fills).
+
+Timing note: quality-first means the 2K-image test case went from
+~2 s (512² squash) to ~26 s (3 MP native-res ROI). Expected and
+accepted — accuracy over speed.
+
+---
+
+## 18. See also
 
 - `AGENTS.md` at the workspace root — project conventions and
   rules.

@@ -14,8 +14,9 @@ change.
 
 A GIMP filter that runs the LaMa ONNX inpainting model on the active
 selection. The model is LaMa (Large Mask inpainting), a 198 MB ONNX
-file that takes a 512×512 image and mask and returns an inpainted
-image. The GIMP plug-in is image-scoped: make a selection, run the
+file with dynamic height/width — it accepts any mod-16 spatial size
+and is run at native resolution (whole image ≤ 4 MP, ROI above that).
+The GIMP plug-in is image-scoped: make a selection, run the
 filter, get the result inside the selection bounds.
 
 The project is laid out as two sub-projects in one repo:
@@ -74,8 +75,12 @@ GIMP process  (MINGW Python 3.14, gi + GEGL only)
                     ▼
            worker process  (Python 3.10+ OR Rust)
                onnxruntime / ort CPU provider
-               🌟 model pipeline: reflect-pad ROI → 512² resize →
-                  single ONNX inference → masked composition →
+               🌟 model pipeline (dynamic-H/W ONNX):
+                  ≤4 MP: pad full frame to mod-16 → single inference
+                         at native resolution (reference behavior)
+                  >4 MP: bbox → context pad → edge-pad crop →
+                         pad to mod-16 (downscale only above 2048 px)
+                  → soft-mask composite (a*out + (1-a)*orig) →
                   RGBA output (input alpha bytes preserved)
 ```
 
@@ -135,10 +140,13 @@ at the parent workspace directory.
    end-to-end behavior. If you change the core pipeline, run both.
 8. **If you change the inference algorithm, you change a contract.**
    The Python core, the Rust worker, and the ONNX model all
-   implement the same algorithm (bbox → context pad → reflect-pad →
-   512² resize → single inference → resize back → masked composition).
-   Any of them changing means the test suite's "max RGB error=0"
-   assertion might fail and need updating.
+   implement the same algorithm (≤4 MP: pad full frame to mod-16 →
+   single inference at native resolution; >4 MP: bbox → context pad →
+   edge-pad crop → pad to mod-16 → inference → soft-mask composite
+   `a*out + (1-a)*orig`). The model input mask is binarized (`> 0`);
+   the composite uses the soft mask. Any of them changing means the
+   test suite's "max RGB error=0" assertion might fail and need
+   updating.
 9. **Document the output convention of any model.** The shipped LaMa
    model outputs 0–255 (divided by 255 after inference). A model swap
    must preserve or adjust this convention; `lama_inpaint.py` and

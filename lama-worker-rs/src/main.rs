@@ -128,10 +128,12 @@ fn run_inpaint(args: &Args) -> Result<()> {
         );
     }
 
-    // Build the f32 HWC image and the bool HW mask. The model itself
-    // only consumes RGB; alpha is preserved separately. The conversion
-    // is parallelized across rows with rayon since it's purely
-    // independent per-pixel work.
+    // Build the f32 HWC image, the bool HW mask (model input), and the
+    // soft f32 HW mask (compositing). The model itself only consumes a
+    // binarized mask (reference predict.py: `(mask > 0) * 1`); the soft
+    // mask preserves GIMP's antialiased selection edges so the final
+    // blend is seamless. The conversions are parallelized across rows
+    // with rayon since they're purely independent per-pixel work.
     let image_hwc: Array3<f32> = {
         let mut arr = Array3::<f32>::zeros((height, width, 3));
         arr.axis_iter_mut(Axis(0))
@@ -144,6 +146,19 @@ fn run_inpaint(args: &Args) -> Result<()> {
                     row[[x, 0]] = p[0] as f32 / 255.0;
                     row[[x, 1]] = p[1] as f32 / 255.0;
                     row[[x, 2]] = p[2] as f32 / 255.0;
+                }
+            });
+        arr
+    };
+    let mask_soft: Array2<f32> = {
+        let mut arr = Array2::<f32>::zeros((height, width));
+        arr.axis_iter_mut(Axis(0))
+            .enumerate()
+            .par_bridge()
+            .for_each(|(y, mut row)| {
+                let y_u32 = y as u32;
+                for x in 0..width {
+                    row[[x]] = mask_gray_u8[(x as u32, y_u32)].0[0] as f32 / 255.0;
                 }
             });
         arr
@@ -169,69 +184,61 @@ fn run_inpaint(args: &Args) -> Result<()> {
         .extension()
         .map_or(false, |e| e == "safetensors");
 
-    // Preprocess: bbox → context pad → reflect-pad crop. Returns the ROI
-    // in original resolution; the caller decides whether to resize (candle)
-    // or pad-to-mod-8 (ONNX with dynamic H/W).
-    let (_img_roi, _mask_roi, roi_info) = preprocess(&image_hwc, &mask)?;
-
-    let result_hwc = if use_candle {
-        marker("provider");
-        tracing::info!("provider: candle-cpu (safetensors)");
-        let device = candle_core::Device::Cpu;
-        let model = candle_infer::CandleInpainter::from_safetensors(&model_path, &device)
-            .context("failed to load safetensors model")?;
-        // Candle path is resolution-preserving: the FFC generator accepts
-        // any H,W divisible by 8. Resizing manga screentone/lines to
-        // 512² and back produces moiré/scatter, so we pad the ROI to
-        // /8 instead (scaling down only when it exceeds a sane cap).
-        const MAX_SIDE: usize = 1024;
-        let (img_roi, mask_roi) = (roi_info.img_roi.clone(), roi_info.mask_roi.clone());
-        let (rh, rw) = (img_roi.dim().0, img_roi.dim().1);
-        let scale = if rh.max(rw) > MAX_SIDE {
-            MAX_SIDE as f32 / rh.max(rw) as f32
-        } else {
-            1.0
-        };
-        let (sh, sw) = (
-            ((rh as f32 * scale).round() as usize).max(1),
-            ((rw as f32 * scale).round() as usize).max(1),
-        );
-        let img_s = if scale < 1.0 { resize_bilinear_hwc(&img_roi, sh, sw) } else { img_roi };
-        let mask_s = if scale < 1.0 { resize_nearest_hw(&mask_roi, sh, sw) } else { mask_roi };
-        // Guard: pad to multiple of 16 so the /8 bottleneck stays even
-        // (the spectral inverse needs an even width for the onesided half).
-        // Also keep the padded side >= 32 so the bottleneck stays >= 4 px.
-        let ph16 = (((sh + 15) / 16 * 16).max(32));
-        let pw16 = (((sw + 15) / 16 * 16).max(32));
-        let pt = (ph16 - sh) / 2;
-        let pl = (pw16 - sw) / 2;
-        let img_pad = reflect_pad_3d(&img_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
-        let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
-        let img_chw = hwc_to_chw_tensor(&img_pad, &device)?;
-        let mask_chw = mask_to_chw_tensor(&mask_pad, &device)?;
-        let out = model
-            .inpaint(&img_chw, &mask_chw)
-            .context("candle inference failed")?;
-        let mut out_hwc = chw_tensor_to_hwc(&out)?;
-        // Crop the pad border and undo the optional downscale so the
-        // result aligns with postprocess()'s ROI expectations.
-        out_hwc = out_hwc
-            .slice(ndarray::s![pt..pt + sh, pl..pl + sw, ..])
-            .to_owned();
-        let out_roi_size = if scale < 1.0 {
-            resize_bilinear_hwc(&out_hwc, rh, rw)
-        } else {
-            out_hwc
-        };
-        postprocess(&out_roi_size, &image_hwc, &roi_info)?
+    // Full-image fast path: when the whole image fits the pixel budget,
+    // run it through the model at native resolution — exactly like the
+    // reference LaMa pipeline (predict.py pads the full frame to mod-8
+    // and infers once). The FFC global branch then sees the entire
+    // image, which is what keeps color/shading consistent across the
+    // selection boundary. No crop, no resize, no warp. The candle
+    // budget is smaller because its DFT is O(N^2) matmul, not FFT.
+    const FULL_IMAGE_MAX_PX_ORT: usize = 4_000_000; // ~4 MP (e.g. 2048x2048)
+    const FULL_IMAGE_MAX_PX_CANDLE: usize = 1_000_000; // ~1 MP
+    let budget = if use_candle {
+        FULL_IMAGE_MAX_PX_CANDLE
     } else {
-        let (mut session, provider_name) = build_session(&model_path)
-            .with_context(|| {
-                format!("failed to build ORT session for {}", model_path.display())
-            })?;
-        marker("provider");
-        tracing::info!("provider: {}", provider_name);
-        run_ort_inpaint(&mut session, &image_hwc, &mask, &roi_info)?
+        FULL_IMAGE_MAX_PX_ORT
+    };
+
+    let result_hwc = if width * height <= budget {
+        let (ph16, pw16, pt, pl) = pad16_dims(height, width);
+        let img_pad =
+            reflect_pad_3d(&image_hwc, pt, pl, ph16 - height - pt, pw16 - width - pl);
+        let mask_pad = reflect_pad_2d(&mask, pt, pl, ph16 - height - pt, pw16 - width - pl);
+        let out_pad = if use_candle {
+            marker("provider");
+            tracing::info!("provider: candle-cpu (safetensors, full-image)");
+            infer_candle(&model_path, &img_pad, &mask_pad)?
+        } else {
+            let (mut session, provider_name) = build_session(&model_path)
+                .with_context(|| {
+                    format!("failed to build ORT session for {}", model_path.display())
+                })?;
+            marker("provider");
+            tracing::info!("provider: {} (full-image)", provider_name);
+            infer_ort(&mut session, &img_pad, &mask_pad)?
+        };
+        let out = out_pad
+            .slice(s![pt..pt + height, pl..pl + width, ..])
+            .to_owned();
+        soft_composite(&image_hwc, &out, &mask_soft)
+    } else {
+        // Large-image path: bbox → context pad → edge-replicate crop →
+        // optional downscale to a per-backend cap → pad to mod-16 →
+        // inference → upscale back → soft-mask composite.
+        let roi_info = preprocess(&image_hwc, &mask, &mask_soft)?;
+        if use_candle {
+            marker("provider");
+            tracing::info!("provider: candle-cpu (safetensors)");
+            run_candle_roi(&model_path, &image_hwc, &roi_info)?
+        } else {
+            let (mut session, provider_name) = build_session(&model_path)
+                .with_context(|| {
+                    format!("failed to build ORT session for {}", model_path.display())
+                })?;
+            marker("provider");
+            tracing::info!("provider: {}", provider_name);
+            run_ort_roi(&mut session, &image_hwc, &roi_info)?
+        }
     };
     let inference_secs = inference_start.elapsed().as_secs_f32();
     marker("inference_done");
@@ -386,15 +393,17 @@ struct RoiInfo {
     paste_box: (usize, usize, usize, usize),
     img_roi: Array3<f32>,
     mask_roi: Array2<bool>,
+    mask_soft_roi: Array2<f32>,
 }
 
-/// Preprocess: bbox → context pad → reflect-pad crop. Returns the ROI
-/// in original resolution; the caller decides whether to resize (candle)
-/// or pad-to-mod-8 (ONNX with dynamic H/W).
+/// Preprocess: bbox → context pad → edge-replicate crop. Returns the ROI
+/// in original resolution inside RoiInfo; the caller decides whether to
+/// downscale + pad-to-mod-16 before inference.
 fn preprocess(
     image: &Array3<f32>,
     mask: &Array2<bool>,
-) -> Result<(Array3<f32>, Array2<bool>, RoiInfo)> {
+    mask_soft: &Array2<f32>,
+) -> Result<RoiInfo> {
     let (height, width) = (image.dim().0, image.dim().1);
     if mask.iter().all(|v| !*v) {
         bail!("empty mask");
@@ -420,32 +429,38 @@ fn preprocess(
     let roi_y1 = sel_y1 as i64 - ctx as i64;
     let roi_w = sel_w + 2 * ctx;
     let roi_h = sel_h + 2 * ctx;
-    let (img_roi, mask_roi, paste_box) =
-        crop_with_reflect_pad(image, mask, roi_x1, roi_y1, roi_w, roi_h);
-    let img_roi_clone = img_roi.clone();
-    let mask_roi_clone = mask_roi.clone();
-    Ok((
+    let (img_roi, mask_roi, mask_soft_roi, paste_box) =
+        crop_with_edge_pad(image, mask, mask_soft, roi_x1, roi_y1, roi_w, roi_h);
+    Ok(RoiInfo {
+        roi_x1,
+        roi_y1,
+        roi_w,
+        roi_h,
+        paste_box,
         img_roi,
         mask_roi,
-        RoiInfo {
-            roi_x1,
-            roi_y1,
-            roi_w,
-            roi_h,
-            paste_box,
-            img_roi: img_roi_clone,
-            mask_roi: mask_roi_clone,
-        },
-    ))
+        mask_soft_roi,
+    })
 }
 
-/// Postprocess: resize 512×512 output back → mask-compose → paste into original.
+/// Postprocess: soft-mask composite the model's ROI output back into the
+/// original image. `a*out + (1-a)*orig` with the soft selection mask:
+/// hard interior (a=1) takes the model output verbatim, antialiased edge
+/// pixels blend gradually, and pixels at a=0 keep the original exactly.
 fn postprocess(
-    out_hwc_512: &Array3<f32>,
+    out_roi: &Array3<f32>,
     image: &Array3<f32>,
     roi: &RoiInfo,
 ) -> Result<Array3<f32>> {
-    let out_roi = resize_bilinear_hwc(out_hwc_512, roi.roi_h, roi.roi_w);
+    if out_roi.dim().0 != roi.roi_h || out_roi.dim().1 != roi.roi_w {
+        bail!(
+            "postprocess shape mismatch: out {}x{}, roi {}x{}",
+            out_roi.dim().0,
+            out_roi.dim().1,
+            roi.roi_h,
+            roi.roi_w
+        );
+    }
     let mut composed_roi = out_roi.clone();
     composed_roi
         .axis_iter_mut(Axis(0))
@@ -453,9 +468,11 @@ fn postprocess(
         .par_bridge()
         .for_each(|(y, mut row)| {
             for x in 0..roi.roi_w {
-                if !roi.mask_roi[[y, x]] {
+                let a = roi.mask_soft_roi[[y, x]];
+                if a < 1.0 {
+                    let inv_a = 1.0 - a;
                     for ch in 0..3 {
-                        row[[x, ch]] = roi.img_roi[[y, x, ch]];
+                        row[[x, ch]] = a * row[[x, ch]] + inv_a * roi.img_roi[[y, x, ch]];
                     }
                 }
             }
@@ -472,40 +489,51 @@ fn postprocess(
     Ok(result)
 }
 
-/// ORT inference path: resolution-preserving, pad-to-mod-8.
-/// The dynamic ONNX model accepts any H,W divisible by 8. We pad the
-/// ROI to /8 (scaling down only above a 1024-px cap), run inference,
-/// crop the pad, and upscale back if needed.
-fn run_ort_inpaint(
-    session: &mut Session,
-    image: &Array3<f32>,
-    _mask: &Array2<bool>,
-    roi: &RoiInfo,
-) -> Result<Array3<f32>> {
-    const MAX_SIDE: usize = 1024;
-    let (img_roi, mask_roi) = (roi.img_roi.clone(), roi.mask_roi.clone());
-    let (rh, rw) = (img_roi.dim().0, img_roi.dim().1);
-    let scale = if rh.max(rw) > MAX_SIDE {
-        MAX_SIDE as f32 / rh.max(rw) as f32
-    } else {
-        1.0
-    };
-    let (sh, sw) = (
-        ((rh as f32 * scale).round() as usize).max(1),
-        ((rw as f32 * scale).round() as usize).max(1),
-    );
-    let img_s = if scale < 1.0 { resize_bilinear_hwc(&img_roi, sh, sw) } else { img_roi };
-    let mask_s = if scale < 1.0 { resize_nearest_hw(&mask_roi, sh, sw) } else { mask_roi };
-    // Guard: pad to multiple of 16 so the /8 bottleneck stays even
-    // (the spectral inverse needs an even width for the onesided half).
-    // Also keep the padded side >= 32 so the bottleneck stays >= 4 px.
-    let ph16 = (((sh + 15) / 16 * 16).max(32));
-    let pw16 = (((sw + 15) / 16 * 16).max(32));
-    let pt = (ph16 - sh) / 2;
-    let pl = (pw16 - sw) / 2;
-    let img_pad = reflect_pad_3d(&img_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
-    let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+/// Full-image compositing: same soft blend as postprocess, over the
+/// whole frame. Pixels at a=0 keep the original exactly.
+fn soft_composite(
+    orig: &Array3<f32>,
+    out: &Array3<f32>,
+    mask_soft: &Array2<f32>,
+) -> Array3<f32> {
+    let (_, w, _) = orig.dim();
+    let mut result = out.clone();
+    result
+        .axis_iter_mut(Axis(0))
+        .enumerate()
+        .par_bridge()
+        .for_each(|(y, mut row)| {
+            for x in 0..w {
+                let a = mask_soft[[y, x]];
+                if a < 1.0 {
+                    let inv_a = 1.0 - a;
+                    for ch in 0..3 {
+                        row[[x, ch]] = a * row[[x, ch]] + inv_a * orig[[y, x, ch]];
+                    }
+                }
+            }
+        });
+    result
+}
 
+/// Centered pad-to-mod-16 dimensions: returns (padded_h, padded_w,
+/// pad_top, pad_left). The /8 FFC bottleneck must stay even for the
+/// onesided spectral inverse, hence mod-16 (not mod-8). Minimum 32 so
+/// the bottleneck stays >= 4 px.
+fn pad16_dims(h: usize, w: usize) -> (usize, usize, usize, usize) {
+    let ph16 = ((h + 15) / 16 * 16).max(32);
+    let pw16 = ((w + 15) / 16 * 16).max(32);
+    (ph16, pw16, (ph16 - h) / 2, (pw16 - w) / 2)
+}
+
+/// ORT inference on an already-padded HWC image + HW bool mask.
+/// Returns HWC f32 in [0, 1] at the padded resolution.
+fn infer_ort(
+    session: &mut Session,
+    img_pad: &Array3<f32>,
+    mask_pad: &Array2<bool>,
+) -> Result<Array3<f32>> {
+    let (ph, pw) = (img_pad.dim().0, img_pad.dim().1);
     let input_names: Vec<String> = session
         .inputs()
         .iter()
@@ -521,12 +549,12 @@ fn run_ort_inpaint(
         .ok_or_else(|| anyhow!("ORT session has no outputs"))?;
 
     let img_chw: Array4<f32> = {
-        let mut arr = Array4::<f32>::zeros((1, 3, ph16, pw16));
+        let mut arr = Array4::<f32>::zeros((1, 3, ph, pw));
         arr.axis_iter_mut(Axis(2))
             .enumerate()
             .par_bridge()
             .for_each(|(y, mut row)| {
-                for x in 0..pw16 {
+                for x in 0..pw {
                     for ch in 0..3 {
                         row[[0, ch, x]] = img_pad[[y, x, ch]];
                     }
@@ -535,12 +563,12 @@ fn run_ort_inpaint(
         arr
     };
     let mask_chw: Array4<f32> = {
-        let mut arr = Array4::<f32>::zeros((1, 1, ph16, pw16));
+        let mut arr = Array4::<f32>::zeros((1, 1, ph, pw));
         arr.axis_iter_mut(Axis(2))
             .enumerate()
             .par_bridge()
             .for_each(|(y, mut row)| {
-                for x in 0..pw16 {
+                for x in 0..pw {
                     row[[0, 0, x]] = if mask_pad[[y, x]] { 1.0_f32 } else { 0.0_f32 };
                 }
             });
@@ -562,58 +590,145 @@ fn run_ort_inpaint(
     let out_4d = out_view.to_owned();
     drop(outputs);
 
-    let out_hwc_padded: Array3<f32> = {
-        let shape = out_4d.shape().to_vec();
-        if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
-            bail!("unexpected ORT output shape {:?}", shape);
-        }
-        let (h, w) = (shape[2], shape[3]);
-        let inv_255 = 1.0_f32 / 255.0;
-        let mut hwc = Array3::<f32>::zeros((h, w, 3));
-        hwc.axis_iter_mut(Axis(0))
-            .enumerate()
-            .par_bridge()
-            .for_each(|(y, mut row)| {
-                for x in 0..w {
-                    for ch in 0..3 {
-                        let v = out_4d[[0, ch, y, x]] * inv_255;
-                        row[[x, ch]] = v.clamp(0.0, 1.0);
-                    }
+    let shape = out_4d.shape().to_vec();
+    if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
+        bail!("unexpected ORT output shape {:?}", shape);
+    }
+    let (h, w) = (shape[2], shape[3]);
+    let inv_255 = 1.0_f32 / 255.0;
+    let mut hwc = Array3::<f32>::zeros((h, w, 3));
+    hwc.axis_iter_mut(Axis(0))
+        .enumerate()
+        .par_bridge()
+        .for_each(|(y, mut row)| {
+            for x in 0..w {
+                for ch in 0..3 {
+                    let v = out_4d[[0, ch, y, x]] * inv_255;
+                    row[[x, ch]] = v.clamp(0.0, 1.0);
                 }
-            });
-        hwc
-    };
+            }
+        });
+    Ok(hwc)
+}
 
-    // Crop the pad border and undo the optional downscale
-    let mut out_hwc = out_hwc_padded
+/// Candle inference on an already-padded HWC image + HW bool mask.
+/// Returns HWC f32 in [0, 1] at the padded resolution.
+fn infer_candle(
+    model_path: &Path,
+    img_pad: &Array3<f32>,
+    mask_pad: &Array2<bool>,
+) -> Result<Array3<f32>> {
+    let device = candle_core::Device::Cpu;
+    let model = candle_infer::CandleInpainter::from_safetensors(model_path, &device)
+        .context("failed to load safetensors model")?;
+    let img_chw = hwc_to_chw_tensor(img_pad, &device)?;
+    let mask_chw = mask_to_chw_tensor(mask_pad, &device)?;
+    let out = model
+        .inpaint(&img_chw, &mask_chw)
+        .context("candle inference failed")?;
+    chw_tensor_to_hwc(&out)
+}
+
+/// ORT ROI path: downscale only above a 2048-px cap, pad to mod-16,
+/// infer, crop pad, upscale back, soft composite.
+fn run_ort_roi(
+    session: &mut Session,
+    image: &Array3<f32>,
+    roi: &RoiInfo,
+) -> Result<Array3<f32>> {
+    const MAX_SIDE: usize = 2048;
+    let (rh, rw) = (roi.roi_h, roi.roi_w);
+    let scale = if rh.max(rw) > MAX_SIDE {
+        MAX_SIDE as f32 / rh.max(rw) as f32
+    } else {
+        1.0
+    };
+    let (sh, sw) = (
+        ((rh as f32 * scale).round() as usize).max(1),
+        ((rw as f32 * scale).round() as usize).max(1),
+    );
+    let img_s = if scale < 1.0 { resize_bilinear_hwc(&roi.img_roi, sh, sw) } else { roi.img_roi.clone() };
+    let mask_s = if scale < 1.0 { resize_nearest_hw(&roi.mask_roi, sh, sw) } else { roi.mask_roi.clone() };
+    let (ph16, pw16, pt, pl) = pad16_dims(sh, sw);
+    let img_pad = reflect_pad_3d(&img_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+    let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+
+    let out_pad = infer_ort(session, &img_pad, &mask_pad)?;
+    let out_cropped = out_pad
         .slice(ndarray::s![pt..pt + sh, pl..pl + sw, ..])
         .to_owned();
-    let out_roi_size = if scale < 1.0 {
-        resize_bilinear_hwc(&out_hwc, rh, rw)
+    let out_roi = if scale < 1.0 {
+        resize_bilinear_hwc(&out_cropped, rh, rw)
     } else {
-        out_hwc
+        out_cropped
     };
+    postprocess(&out_roi, image, roi)
+}
 
-    postprocess(&out_roi_size, image, roi)
+/// Candle ROI path: same shape as the ORT one but with a 1024-px cap
+/// (candle's DFT is O(N^2) matmul, so large sides get expensive fast).
+fn run_candle_roi(
+    model_path: &Path,
+    image: &Array3<f32>,
+    roi: &RoiInfo,
+) -> Result<Array3<f32>> {
+    const MAX_SIDE: usize = 1024;
+    let (rh, rw) = (roi.roi_h, roi.roi_w);
+    let scale = if rh.max(rw) > MAX_SIDE {
+        MAX_SIDE as f32 / rh.max(rw) as f32
+    } else {
+        1.0
+    };
+    let (sh, sw) = (
+        ((rh as f32 * scale).round() as usize).max(1),
+        ((rw as f32 * scale).round() as usize).max(1),
+    );
+    let img_s = if scale < 1.0 { resize_bilinear_hwc(&roi.img_roi, sh, sw) } else { roi.img_roi.clone() };
+    let mask_s = if scale < 1.0 { resize_nearest_hw(&roi.mask_roi, sh, sw) } else { roi.mask_roi.clone() };
+    let (ph16, pw16, pt, pl) = pad16_dims(sh, sw);
+    let img_pad = reflect_pad_3d(&img_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+    let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+
+    let out_pad = infer_candle(model_path, &img_pad, &mask_pad)?;
+    let out_cropped = out_pad
+        .slice(ndarray::s![pt..pt + sh, pl..pl + sw, ..])
+        .to_owned();
+    let out_roi = if scale < 1.0 {
+        resize_bilinear_hwc(&out_cropped, rh, rw)
+    } else {
+        out_cropped
+    };
+    postprocess(&out_roi, image, roi)
 }
 
 
-fn crop_with_reflect_pad(
+/// Crop the ROI from the image, edge-replicating any part that extends
+/// past the image bounds (matches the Python `_crop_with_reflect_pad`,
+/// which uses `np.pad(mode="edge")`). Edge-replicate gives the FFC
+/// local branches flat, neutral context; mirror padding can produce
+/// symmetric structures the model copies into the inpaint.
+///
+/// Returns (img_roi, mask_roi, mask_soft_roi, paste_box) where
+/// paste_box is the (y1, y2, x1, x2) of the valid region in original
+/// image coordinates.
+fn crop_with_edge_pad(
     image: &Array3<f32>,
     mask: &Array2<bool>,
+    mask_soft: &Array2<f32>,
     roi_x1: i64,
     roi_y1: i64,
     roi_w: usize,
     roi_h: usize,
-) -> (Array3<f32>, Array2<bool>, (usize, usize, usize, usize)) {
+) -> (Array3<f32>, Array2<bool>, Array2<f32>, (usize, usize, usize, usize)) {
     let (h, w) = (image.dim().0 as i64, image.dim().1 as i64);
     let pad_left = std::cmp::max(0, -roi_x1) as usize;
     let pad_top = std::cmp::max(0, -roi_y1) as usize;
     let pad_right = std::cmp::max(0, (roi_x1 + roi_w as i64) - w) as usize;
     let pad_bottom = std::cmp::max(0, (roi_y1 + roi_h as i64) - h) as usize;
 
-    let img_padded = reflect_pad_3d(image, pad_top, pad_left, pad_bottom, pad_right);
-    let mask_padded = reflect_pad_2d(mask, pad_top, pad_left, pad_bottom, pad_right);
+    let img_padded = edge_pad_3d(image, pad_top, pad_left, pad_bottom, pad_right);
+    let mask_padded = edge_pad_2d_bool(mask, pad_top, pad_left, pad_bottom, pad_right);
+    let soft_padded = edge_pad_2d_f32(mask_soft, pad_top, pad_left, pad_bottom, pad_right);
 
     let new_roi_x1 = (roi_x1 + pad_left as i64) as usize;
     let new_roi_y1 = (roi_y1 + pad_top as i64) as usize;
@@ -631,13 +746,97 @@ fn crop_with_reflect_pad(
             new_roi_x1..new_roi_x1 + roi_w
         ])
         .to_owned();
+    let mask_soft_roi = soft_padded
+        .slice(s![
+            new_roi_y1..new_roi_y1 + roi_h,
+            new_roi_x1..new_roi_x1 + roi_w
+        ])
+        .to_owned();
 
     let y1 = std::cmp::max(0, roi_y1) as usize;
     let y2 = std::cmp::min(h, roi_y1 + roi_h as i64) as usize;
     let x1 = std::cmp::max(0, roi_x1) as usize;
     let x2 = std::cmp::min(w, roi_x1 + roi_w as i64) as usize;
 
-    (img_roi, mask_roi, (y1, y2, x1, x2))
+    (img_roi, mask_roi, mask_soft_roi, (y1, y2, x1, x2))
+}
+
+fn edge_index(i: i64, size: i64) -> i64 {
+    i.clamp(0, size - 1)
+}
+
+fn edge_pad_3d(
+    arr: &Array3<f32>,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+) -> Array3<f32> {
+    let (h, w, c) = (arr.dim().0 as i64, arr.dim().1 as i64, arr.dim().2);
+    let new_h = (h as usize) + pad_top + pad_bottom;
+    let new_w = (w as usize) + pad_left + pad_right;
+    let mut out = Array3::<f32>::zeros((new_h, new_w, c));
+    out.axis_iter_mut(Axis(0))
+        .enumerate()
+        .par_bridge()
+        .for_each(|(ny, mut out_row)| {
+            let oy = edge_index(ny as i64 - pad_top as i64, h) as usize;
+            for nx in 0..new_w {
+                let ox = edge_index(nx as i64 - pad_left as i64, w) as usize;
+                for ch in 0..c {
+                    out_row[[nx, ch]] = arr[[oy, ox, ch]];
+                }
+            }
+        });
+    out
+}
+
+fn edge_pad_2d_bool(
+    arr: &Array2<bool>,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+) -> Array2<bool> {
+    let (h, w) = (arr.dim().0 as i64, arr.dim().1 as i64);
+    let new_h = (h as usize) + pad_top + pad_bottom;
+    let new_w = (w as usize) + pad_left + pad_right;
+    let mut out = Array2::<bool>::from_elem((new_h, new_w), false);
+    out.axis_iter_mut(Axis(0))
+        .enumerate()
+        .par_bridge()
+        .for_each(|(ny, mut out_row)| {
+            let oy = edge_index(ny as i64 - pad_top as i64, h) as usize;
+            for nx in 0..new_w {
+                let ox = edge_index(nx as i64 - pad_left as i64, w) as usize;
+                out_row[[nx]] = arr[[oy, ox]];
+            }
+        });
+    out
+}
+
+fn edge_pad_2d_f32(
+    arr: &Array2<f32>,
+    pad_top: usize,
+    pad_left: usize,
+    pad_bottom: usize,
+    pad_right: usize,
+) -> Array2<f32> {
+    let (h, w) = (arr.dim().0 as i64, arr.dim().1 as i64);
+    let new_h = (h as usize) + pad_top + pad_bottom;
+    let new_w = (w as usize) + pad_left + pad_right;
+    let mut out = Array2::<f32>::zeros((new_h, new_w));
+    out.axis_iter_mut(Axis(0))
+        .enumerate()
+        .par_bridge()
+        .for_each(|(ny, mut out_row)| {
+            let oy = edge_index(ny as i64 - pad_top as i64, h) as usize;
+            for nx in 0..new_w {
+                let ox = edge_index(nx as i64 - pad_left as i64, w) as usize;
+                out_row[[nx]] = arr[[oy, ox]];
+            }
+        });
+    out
 }
 
 fn reflect_index(i: i64, size: i64) -> i64 {
