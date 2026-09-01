@@ -19,6 +19,16 @@ and is run at native resolution (whole image ≤ 4 MP, ROI above that).
 The GIMP plug-in is image-scoped: make a selection, run the
 filter, get the result inside the selection bounds.
 
+**Quality bar (v1.1+):** The pipeline is tuned for maximum visual
+fidelity. Images ≤ 4 MP run at native resolution (no ROI crop, no
+resize — exactly like reference LaMa). The model input mask is
+binarized at `> 0`, but compositing blends with the soft mask so
+antialiased edges transition seamlessly. The tradeoff is speed:
+expect ~25–30 s for a 1.8 MP photo on CPU instead of ~2 s. This is
+considered the right call for a tool you run once per edit; if you
+need speed over quality, reduce the pixel budget or lower the
+MAX_SIDE cap in the worker code.
+
 The project is laid out as two sub-projects in one repo:
 
 ```

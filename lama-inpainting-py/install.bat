@@ -30,10 +30,13 @@ for %%F in (lama-inpaint.py lama_worker.py lama_inpaint.py) do (
     )
 )
 
-REM The LaMa model is fetched from HuggingFace if not present in the
-REM source dir. This keeps the repo small (model is ~200 MB) while
-REM still giving the user a one-command install.
-set "LAMA_MODEL_URL=https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx?download=true"
+REM The LaMa model is fetched from the GitHub release if not present
+REM in the source dir. This keeps the repo small (model is ~200 MB)
+REM while still giving the user a one-command install. NOTE: this is
+REM the dynamic-H/W export (accepts any mod-16 spatial size), NOT the
+REM original fixed-512 Carve/LaMa-ONNX file — the fixed export
+REM force-squashes every ROI to 512² and ruins quality.
+set "LAMA_MODEL_URL=https://github.com/CloudyTabzy/Gimp-lama-inpainting/releases/download/v1.1.0/lama_fp32.onnx"
 set "LAMA_MODEL_PATH=%SRC%lama_fp32.onnx"
 if not exist "%LAMA_MODEL_PATH%" (
     echo.
@@ -221,9 +224,9 @@ echo dependencies). Set LAMA_USE_RUST_WORKER=0 or
 echo "worker_kind": "python" to force the Python worker.
 echo.
 echo The plug-in needs one ONNX model:
-echo   lama_fp32.onnx      (LaMa inpainter, ~198 MB, fast ~2 s)
+echo   lama_fp32.onnx      (LaMa inpainter, ~198 MB, dynamic-H/W)
 echo.
-echo This was downloaded from HuggingFace during install. If the
+echo This was downloaded from the GitHub release during install. If the
 echo download failed, get it from:
 echo   %LAMA_MODEL_URL%
 echo and place it at:

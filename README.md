@@ -27,6 +27,26 @@ It works on any layer that has a non-empty selection — photographs,
 drawings, textures, anywhere you have something missing and need it
 filled.
 
+### Quality bar (v1.1+)
+
+The pipeline is tuned for **maximum visual fidelity**, not speed:
+
+- **Native-resolution inference** — images up to 4 MP are fed to the
+  model *whole*, exactly like the reference LaMa pipeline. No resize,
+  no squash, no warp. The model's global Fourier branch sees the full
+  image, which is what keeps color and shading consistent across the
+  selection boundary.
+- **Seamless edges** — the model receives a binarized mask (reference
+  behavior), but the final blend uses GIMP's *soft* selection values,
+  so antialiased edges transition gradually instead of showing a hard
+  cut. Outside the selection: bit-exact original pixels.
+- **No blur from resize round-trips** — the old fixed-512² export
+  forced every region through a downscale→upscale cycle. That's gone.
+
+The tradeoff is speed: quality-first means ~25–30 s for a 1.8 MP photo
+on CPU instead of ~2 s. We consider that the right call for a tool you
+run once per edit.
+
 ---
 
 ## Features
@@ -34,8 +54,10 @@ filled.
 | Feature | Status |
 |---|---|
 | 🖼️  GIMP 3.2 filter via Filters → Enhance menu | ✅ |
+| ✨  **Native-resolution inference** — whole image ≤ 4 MP, ROI above | ✅ |
 | 🎨  Adaptive ROI around the selection (native resolution for Manga) | ✅ |
-| 🔁  Reflect-pad crop for edge-touching selections | ✅ |
+| 🌗  **Soft-mask edge blending** — antialiased selections, no visible seam | ✅ |
+| 🔁  Edge-replicate crop for edge-touching selections | ✅ |
 | 🪄  Preserves pixels outside the selection byte-for-byte | ✅ |
 | 🐍  Default Python worker (no build step) | ✅ |
 | 🦀  Optional Rust worker — ~2× faster cold-start, also runs Manga model | ✅ |
@@ -50,15 +72,24 @@ filled.
 
 ## Performance
 
+> **v1.1 quality-first note:** inference now runs at *native resolution*
+> (whole image ≤ 4 MP, ROI above), not at a squashed 512². That is
+> deliberately slower than v1.0 — expect ~2 s for small regions to
+> ~30 s for a 1.8 MP photo on CPU — in exchange for no resize blur,
+> no geometric warp, and seamless selection edges.
+
 The model runs on ONNX Runtime with the CPU execution provider.
 Both the Python and Rust workers feed the same `ort` C++ backend, so
-the inference time is identical (~1.75 s per call on CPU). The
-difference is in everything *around* the inference:
+the inference time is identical between them. The difference is in
+everything *around* the inference:
 
 | Path | First call | Warm steady-state | Notes |
 |---|---|---|---|
-| 🐍  **Python worker** | ~20 s | ~2 s | Interpreter startup + `numpy` + `onnxruntime` + `PIL` import |
-| 🦀  **Rust worker** | ~5 s | ~3.4 s | Statically linked, no interpreter |
+| 🐍  **Python worker** | ~30–45 s | ~25–30 s | Interpreter startup + `numpy` + `onnxruntime` + `PIL` import |
+| 🦀  **Rust worker** | ~30 s | ~27 s | Statically linked, no interpreter |
+
+(timings: 1131×1600 photo, medium selection, CPU; smaller images are
+proportionally faster — a 512² region is ~2 s)
 
 That's a **~4× speedup on first call** and a similar wall-clock
 advantage on every subsequent call, with no code changes to the
@@ -71,7 +102,7 @@ as the Python one.
 |---|---|---|
 | Interpreter + library startup | 5–15 s | Python only |
 | Statically-linked binary startup | ~0.05 s | Rust only |
-| ORT inference (same in both) | ~1.75 s | ORT CPU EP |
+| ORT inference (same in both) | 2–27 s | ORT CPU EP, scales with native pixel count |
 | Pre/postprocessing (parallelized with `rayon`) | ~1.65 s | Both |
 | File I/O | ~0.1 s | Both |
 
@@ -87,8 +118,11 @@ The plug-in includes two models:
 | **LaMa Manga** | `lama-manga.safetensors` | ~195 MB | Anime, manga, comic art |
 
 The **General** model is the standard LaMa from
-[Carve/LaMa-ONNX](https://huggingface.co/Carve/LaMa-ONNX) — good for
-photos, soft fills, background removal.
+[Carve/LaMa-ONNX](https://huggingface.co/Carve/LaMa-ONNX), re-exported
+with **dynamic height/width** so it runs at native resolution (the
+original export is frozen at 512×512 and force-squashes every region
+into a square — we don't ship it anymore). Good for photos, soft fills,
+background removal.
 
 The **Manga** model is a fine-tuned Big-LaMa from
 [Sanster/anime-manga-big-lama](https://github.com/Sanster/models/releases/download/AnimeMangaInpainting/anime-manga-big-lama.pt)
@@ -97,8 +131,8 @@ art, screentone, and comic textures. **Not suitable for photographs**
 (it will invent manga-style line work).
 
 Both are **not** stored in the repo — the installer downloads the
-General model from HuggingFace. The Manga model is available from the
-[Releases](../../releases) page.
+General model from the [Releases](../../releases) page (it's the
+`lama_fp32.onnx` asset). The Manga model is in the release zip.
 
 ### Model selection
 
