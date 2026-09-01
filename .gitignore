@@ -23,6 +23,9 @@ lama-inpainting-py/lama_config.json
 # printed on first use.
 lama-inpainting-py/lama_fp32.onnx
 
+# Manga model — too large for git, download from Releases or HuggingFace.
+models/
+
 # OS junk
 .DS_Store
 Thumbs.db

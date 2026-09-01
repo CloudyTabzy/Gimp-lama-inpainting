@@ -137,6 +137,9 @@ copy /Y "%SRC%lama_config.json" "%DEST%\lama_config.json" >nul || goto :copy_fai
 if exist "%SRC%lama_fp32.onnx" (
     copy /Y "%SRC%lama_fp32.onnx" "%DEST%\lama_fp32.onnx" >nul || goto :copy_failed
 )
+if exist "%SRC%..\models\lama-manga.safetensors" (
+    copy /Y "%SRC%..\models\lama-manga.safetensors" "%DEST%\lama-manga.safetensors" >nul || goto :copy_failed
+)
 
 echo.
 echo Attempting optional Rust worker build...

@@ -25,6 +25,8 @@ use ort::{
 };
 use rayon::prelude::*;
 
+mod candle_infer;
+
 /// Fixed LaMa ONNX input spatial size. The model was exported at 512x512.
 const MODEL_INPUT: usize = 512;
 /// Mask threshold in 0..=255. Pixels strictly above become "inpaint".
@@ -157,18 +159,74 @@ fn run_inpaint(args: &Args) -> Result<()> {
         arr
     };
 
-    // Build the ORT session with CPU execution provider.
-    let (mut session, provider_name) = build_session(&model_path)
-        .with_context(|| format!("failed to build ORT session for {}", model_path.display()))?;
-
-    marker("provider");
-    // Print the active provider as a colon-delimited form so the
-    // parent can parse it: `[LAMA_MARKER] provider <name>`
-    tracing::info!("provider: {}", provider_name);
-
     marker("inference_start");
     let inference_start = Instant::now();
-    let result_hwc = inpaint(&mut session, &image_hwc, &mask)?;
+
+    let use_candle = model_path
+        .extension()
+        .map_or(false, |e| e == "safetensors");
+
+    // ONNX path: fixed 512×512 export → must resize.
+    let (img_512, mask_512, roi_info) = preprocess(&image_hwc, &mask)?;
+
+    let result_hwc = if use_candle {
+        marker("provider");
+        tracing::info!("provider: candle-cpu (safetensors)");
+        let device = candle_core::Device::Cpu;
+        let model = candle_infer::CandleInpainter::from_safetensors(&model_path, &device)
+            .context("failed to load safetensors model")?;
+        // Candle path is resolution-preserving: the FFC generator accepts
+        // any H,W divisible by 8. Resizing manga screentone/lines to
+        // 512² and back produces moiré/scatter, so we pad the ROI to
+        // /8 instead (scaling down only when it exceeds a sane cap).
+        const MAX_SIDE: usize = 1024;
+        let (img_roi, mask_roi) = (roi_info.img_roi.clone(), roi_info.mask_roi.clone());
+        let (rh, rw) = (img_roi.dim().0, img_roi.dim().1);
+        let scale = if rh.max(rw) > MAX_SIDE {
+            MAX_SIDE as f32 / rh.max(rw) as f32
+        } else {
+            1.0
+        };
+        let (sh, sw) = (
+            ((rh as f32 * scale).round() as usize).max(1),
+            ((rw as f32 * scale).round() as usize).max(1),
+        );
+        let img_s = if scale < 1.0 { resize_bilinear_hwc(&img_roi, sh, sw) } else { img_roi };
+        let mask_s = if scale < 1.0 { resize_nearest_hw(&mask_roi, sh, sw) } else { mask_roi };
+        // Guard: keep the /8-padded side >= 32 so the /8 bottleneck stays
+        // >= 4 px (the spectral inverse needs width > its onesided half).
+        let ph8 = (((sh + 7) / 8 * 8).max(32));
+        let pw8 = (((sw + 7) / 8 * 8).max(32));
+        let pt = (ph8 - sh) / 2;
+        let pl = (pw8 - sw) / 2;
+        let img_pad = reflect_pad_3d(&img_s, pt, pl, ph8 - sh - pt, pw8 - sw - pl);
+        let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph8 - sh - pt, pw8 - sw - pl);
+        let img_chw = hwc_to_chw_tensor(&img_pad, &device)?;
+        let mask_chw = mask_to_chw_tensor(&mask_pad, &device)?;
+        let out = model
+            .inpaint(&img_chw, &mask_chw)
+            .context("candle inference failed")?;
+        let mut out_hwc = chw_tensor_to_hwc(&out)?;
+        // Crop the pad border and undo the optional downscale so the
+        // result aligns with postprocess()'s ROI expectations.
+        out_hwc = out_hwc
+            .slice(ndarray::s![pt..pt + sh, pl..pl + sw, ..])
+            .to_owned();
+        let out_roi_size = if scale < 1.0 {
+            resize_bilinear_hwc(&out_hwc, rh, rw)
+        } else {
+            out_hwc
+        };
+        postprocess(&out_roi_size, &image_hwc, &roi_info)?
+    } else {
+        let (mut session, provider_name) = build_session(&model_path)
+            .with_context(|| {
+                format!("failed to build ORT session for {}", model_path.display())
+            })?;
+        marker("provider");
+        tracing::info!("provider: {}", provider_name);
+        run_ort_inpaint(&mut session, &image_hwc, &mask, &img_512, &mask_512, &roi_info)?
+    };
     let inference_secs = inference_start.elapsed().as_secs_f32();
     marker("inference_done");
     tracing::info!("inference took {:.3}s", inference_secs);
@@ -211,6 +269,55 @@ fn run_inpaint(args: &Args) -> Result<()> {
 
 fn quantize(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Convert HWC f32 array to CHW candle Tensor (1,C,H,W).
+fn hwc_to_chw_tensor(hwc: &Array3<f32>, dev: &candle_core::Device) -> Result<candle_core::Tensor> {
+    let (h, w, c) = hwc.dim();
+    let mut data = Vec::with_capacity(c * h * w);
+    for ch in 0..c {
+        for y in 0..h {
+            for x in 0..w {
+                data.push(hwc[[y, x, ch]]);
+            }
+        }
+    }
+    candle_core::Tensor::from_vec(data, (1, c, h, w), dev).map_err(|e| anyhow!("{}", e))
+}
+
+/// Convert HW bool mask to (1,1,H,W) f32 candle Tensor.
+fn mask_to_chw_tensor(mask: &Array2<bool>, dev: &candle_core::Device) -> Result<candle_core::Tensor> {
+    let (h, w) = mask.dim();
+    let data: Vec<f32> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| if mask[[y, x]] { 1.0f32 } else { 0.0 }))
+        .collect();
+    candle_core::Tensor::from_vec(data, (1, 1, h, w), dev).map_err(|e| anyhow!("{}", e))
+}
+
+/// Convert candle (1,3,H,W) Tensor in [0,255] to HWC f32 array in [0,1].
+fn chw_tensor_to_hwc(t: &candle_core::Tensor) -> Result<Array3<f32>> {
+    let (b, c, h, w) = t.dims4()?;
+    if b != 1 || c != 3 {
+        bail!("unexpected tensor shape {:?}", t.shape());
+    }
+    let data = t
+        .to_dtype(candle_core::DType::F32)
+        .map_err(|e| anyhow!("{}", e))?
+        .flatten_all()
+        .map_err(|e| anyhow!("{}", e))?
+        .to_vec1::<f32>()
+        .map_err(|e| anyhow!("{}", e))?;
+    let inv = 1.0f32 / 255.0;
+    let mut out = Array3::<f32>::zeros((h, w, 3));
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..3 {
+                let v = data[ch * h * w + y * w + x] * inv;
+                out[[y, x, ch]] = v.clamp(0.0, 1.0);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn marker(stage: &str) {
@@ -262,6 +369,189 @@ fn build_session(model_path: &Path) -> Result<(Session, &'static str)> {
     #[cfg(not(feature = "webgpu"))]
     let provider_name: &'static str = "CPU";
     Ok((session, provider_name))
+}
+
+/// ROI context shared between preprocessing and postprocessing.
+struct RoiInfo {
+    roi_x1: i64,
+    roi_y1: i64,
+    roi_w: usize,
+    roi_h: usize,
+    paste_box: (usize, usize, usize, usize),
+    img_roi: Array3<f32>,
+    mask_roi: Array2<bool>,
+}
+
+/// Preprocess: bbox → context pad → reflect-pad crop → resize to 512×512.
+fn preprocess(
+    image: &Array3<f32>,
+    mask: &Array2<bool>,
+) -> Result<(Array3<f32>, Array2<bool>, RoiInfo)> {
+    let (height, width) = (image.dim().0, image.dim().1);
+    if mask.iter().all(|v| !*v) {
+        bail!("empty mask");
+    }
+    let (mut sel_x1, mut sel_y1) = (width, height);
+    let (mut sel_x2, mut sel_y2): (usize, usize) = (0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            if mask[[y, x]] {
+                sel_x1 = sel_x1.min(x);
+                sel_y1 = sel_y1.min(y);
+                sel_x2 = sel_x2.max(x);
+                sel_y2 = sel_y2.max(y);
+            }
+        }
+    }
+    let sel_w = sel_x2 - sel_x1 + 1;
+    let sel_h = sel_y2 - sel_y1 + 1;
+    let ctx = std::cmp::max(1, (std::cmp::max(sel_w, sel_h) as f32).round() as usize);
+    let roi_x1 = sel_x1 as i64 - ctx as i64;
+    let roi_y1 = sel_y1 as i64 - ctx as i64;
+    let roi_w = sel_w + 2 * ctx;
+    let roi_h = sel_h + 2 * ctx;
+    let (img_roi, mask_roi, paste_box) =
+        crop_with_reflect_pad(image, mask, roi_x1, roi_y1, roi_w, roi_h);
+    let img_512 = resize_bilinear_hwc(&img_roi, MODEL_INPUT, MODEL_INPUT);
+    let mask_512 = resize_nearest_hw(&mask_roi, MODEL_INPUT, MODEL_INPUT);
+    Ok((
+        img_512,
+        mask_512,
+        RoiInfo {
+            roi_x1,
+            roi_y1,
+            roi_w,
+            roi_h,
+            paste_box,
+            img_roi,
+            mask_roi,
+        },
+    ))
+}
+
+/// Postprocess: resize 512×512 output back → mask-compose → paste into original.
+fn postprocess(
+    out_hwc_512: &Array3<f32>,
+    image: &Array3<f32>,
+    roi: &RoiInfo,
+) -> Result<Array3<f32>> {
+    let out_roi = resize_bilinear_hwc(out_hwc_512, roi.roi_h, roi.roi_w);
+    let mut composed_roi = out_roi.clone();
+    composed_roi
+        .axis_iter_mut(Axis(0))
+        .enumerate()
+        .par_bridge()
+        .for_each(|(y, mut row)| {
+            for x in 0..roi.roi_w {
+                if !roi.mask_roi[[y, x]] {
+                    for ch in 0..3 {
+                        row[[x, ch]] = roi.img_roi[[y, x, ch]];
+                    }
+                }
+            }
+        });
+    let (y1, y2, x1, x2) = roi.paste_box;
+    let real_y1 = std::cmp::max(0, -roi.roi_y1) as usize;
+    let real_x1 = std::cmp::max(0, -roi.roi_x1) as usize;
+    let real_y2 = real_y1 + (y2 - y1);
+    let real_x2 = real_x1 + (x2 - x1);
+    let mut result = image.clone();
+    let mut sub = result.slice_mut(s![y1..y2, x1..x2, ..]).to_owned();
+    sub.assign(&composed_roi.slice(s![real_y1..real_y2, real_x1..real_x2, ..]));
+    result
+        .slice_mut(s![y1..y2, x1..x2, ..])
+        .assign(&sub);
+    Ok(result)
+}
+
+/// ORT inference path: convert to CHW, run session, convert back.
+fn run_ort_inpaint(
+    session: &mut Session,
+    image: &Array3<f32>,
+    mask: &Array2<bool>,
+    img_512: &Array3<f32>,
+    mask_512: &Array2<bool>,
+    roi: &RoiInfo,
+) -> Result<Array3<f32>> {
+    let input_names: Vec<String> = session
+        .inputs()
+        .iter()
+        .map(|o| o.name().to_string())
+        .collect();
+    if input_names.len() != 2 {
+        bail!("expected exactly 2 ORT inputs, got {}", input_names.len());
+    }
+    let output_name = session
+        .outputs()
+        .first()
+        .map(|o| o.name().to_string())
+        .ok_or_else(|| anyhow!("ORT session has no outputs"))?;
+
+    let img_chw: Array4<f32> = {
+        let mut arr = Array4::<f32>::zeros((1, 3, MODEL_INPUT, MODEL_INPUT));
+        arr.axis_iter_mut(Axis(2))
+            .enumerate()
+            .par_bridge()
+            .for_each(|(y, mut row)| {
+                for x in 0..MODEL_INPUT {
+                    for ch in 0..3 {
+                        row[[0, ch, x]] = img_512[[y, x, ch]];
+                    }
+                }
+            });
+        arr
+    };
+    let mask_chw: Array4<f32> = {
+        let mut arr = Array4::<f32>::zeros((1, 1, MODEL_INPUT, MODEL_INPUT));
+        arr.axis_iter_mut(Axis(2))
+            .enumerate()
+            .par_bridge()
+            .for_each(|(y, mut row)| {
+                for x in 0..MODEL_INPUT {
+                    row[[0, 0, x]] = if mask_512[[y, x]] { 1.0_f32 } else { 0.0_f32 };
+                }
+            });
+        arr
+    };
+
+    let outputs = session
+        .run(inputs![
+            input_names[0].as_str() => TensorRef::from_array_view(img_chw.view())?,
+            input_names[1].as_str() => TensorRef::from_array_view(mask_chw.view())?,
+        ])
+        .map_err(|e| anyhow!("ORT run failed: {}", e))?;
+
+    let out_view = outputs
+        .get(output_name.as_str())
+        .ok_or_else(|| anyhow!("ORT output `{}` missing", output_name))?
+        .try_extract_array::<f32>()
+        .map_err(|e| anyhow!("ORT output extraction failed: {}", e))?;
+    let out_4d = out_view.to_owned();
+    drop(outputs);
+
+    let out_hwc_512: Array3<f32> = {
+        let shape = out_4d.shape().to_vec();
+        if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
+            bail!("unexpected ORT output shape {:?}", shape);
+        }
+        let (h, w) = (shape[2], shape[3]);
+        let inv_255 = 1.0_f32 / 255.0;
+        let mut hwc = Array3::<f32>::zeros((h, w, 3));
+        hwc.axis_iter_mut(Axis(0))
+            .enumerate()
+            .par_bridge()
+            .for_each(|(y, mut row)| {
+                for x in 0..w {
+                    for ch in 0..3 {
+                        let v = out_4d[[0, ch, y, x]] * inv_255;
+                        row[[x, ch]] = v.clamp(0.0, 1.0);
+                    }
+                }
+            });
+        hwc
+    };
+
+    postprocess(&out_hwc_512, image, roi)
 }
 
 /// Core inpainting routine. Mirrors the Python `LamaInpainter.inpaint`

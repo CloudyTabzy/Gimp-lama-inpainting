@@ -29,8 +29,11 @@ import time
 from types import SimpleNamespace
 
 import gi
+gi.require_version('Gegl', '0.4')
+gi.require_version('Gimp', '3.0')
+gi.require_version('GimpUi', '3.0')
 
-from gi.repository import Gegl, Gimp, GimpUi, GLib
+from gi.repository import Gegl, Gimp, GimpUi, GLib, GObject
 
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +48,7 @@ LOG_MAX_LINES = 200
 WORKER_SCRIPT = os.path.abspath(os.path.join(PLUGIN_DIR, "lama_worker.py"))
 RUST_WORKER_BINARY = os.path.abspath(os.path.join(PLUGIN_DIR, "lama_worker_rust.exe"))
 MODEL_PATH = os.path.abspath(os.path.join(PLUGIN_DIR, "lama_fp32.onnx"))
+MANGA_MODEL_PATH = os.path.abspath(os.path.join(PLUGIN_DIR, "lama-manga.safetensors"))
 CONFIG_PATH = os.path.abspath(os.path.join(PLUGIN_DIR, "lama_config.json"))
 
 WORKER_TIMEOUT_SECONDS = 300
@@ -547,6 +551,21 @@ class LamaInpaint(Gimp.PlugIn):
             procedure.set_menu_label("_LaMa Inpaint...")
             procedure.set_icon_name(GimpUi.ICON_GEGL)
             procedure.add_menu_path("<Image>/Filters/Enhance/")
+
+            # Model selection choice.
+            choice = Gimp.Choice.new()
+            choice.add("lama", 0, "_LaMa (general)", "")
+            if os.path.isfile(MANGA_MODEL_PATH):
+                choice.add("manga", 1, "_Manga (line art)", "")
+            procedure.add_choice_argument(
+                "model",
+                "Mo_del",
+                "Inpainting model to use",
+                choice,
+                "lama",
+                GObject.ParamFlags.READWRITE,
+            )
+
             procedure.set_documentation(
                 "Inpaint the active selection with the LaMa model "
                 "(single-pass, ~2 s).",
@@ -565,11 +584,25 @@ class LamaInpaint(Gimp.PlugIn):
         return None
 
     def run(self, procedure, run_mode, image, drawables, config, run_data):
-        return self._run_lama(procedure, run_mode, image, drawables)
+        try:
+            if run_mode == Gimp.RunMode.INTERACTIVE:
+                dialog = GimpUi.ProcedureDialog.new(procedure, config)
+                dialog.fill(["model"])
+                if not dialog.run():
+                    dialog.destroy()
+                    return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+                dialog.destroy()
+
+            model_choice = config.get_property("model")
+            _log(f"run: model_choice={model_choice}, run_mode={run_mode}")
+            return self._run_lama(procedure, run_mode, image, drawables, model_choice)
+        except Exception as exc:
+            _log(f"run EXCEPTION: {exc}")
+            return _execution_error(procedure, f"LaMa Inpaint error: {exc}")
 
     # ----------------- LaMa backend -----------------
 
-    def _run_lama(self, procedure, run_mode, image, drawables):
+    def _run_lama(self, procedure, run_mode, image, drawables, model_choice="lama"):
         # Progress is started exactly once after the cheap pre-flight
         # checks have all passed, and is always ended in ``finally`` so
         # the GIMP progress bar cannot be left in a half-state on any
@@ -616,10 +649,16 @@ class LamaInpaint(Gimp.PlugIn):
             if width <= 0 or height <= 0:
                 return _calling_error(procedure, "The active drawable is empty.")
 
-            if not os.path.isfile(MODEL_PATH):
+            # Select model based on user choice.
+            if model_choice == "manga" and os.path.isfile(MANGA_MODEL_PATH):
+                model_path = MANGA_MODEL_PATH
+            else:
+                model_path = MODEL_PATH
+
+            if not os.path.isfile(model_path):
                 return _calling_error(
                     procedure,
-                    f"LaMa model is missing: {MODEL_PATH}. Reinstall the plug-in.",
+                    f"Model is missing: {model_path}. Reinstall the plug-in.",
                 )
 
             # Worker selection. The Rust worker is an opt-in drop-in
@@ -693,7 +732,7 @@ class LamaInpaint(Gimp.PlugIn):
                             "--output",
                             output_path,
                             "--model",
-                            MODEL_PATH,
+                            model_path,
                         ]
                     else:
                         command = [
@@ -706,7 +745,7 @@ class LamaInpaint(Gimp.PlugIn):
                             "--output",
                             output_path,
                             "--model",
-                            MODEL_PATH,
+                            model_path,
                         ]
 
                     _phase("Starting LaMa worker...", 0.30)

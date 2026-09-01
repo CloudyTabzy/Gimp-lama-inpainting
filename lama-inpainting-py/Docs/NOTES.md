@@ -392,7 +392,289 @@ project's source tree.
 
 ---
 
-## 13. See also
+## 13. GIMP 3.x Python plug-in registration pitfalls (2026-08)
+
+When adding the manga model support, we hit several GIMP 3.x API
+issues that caused the plug-in to silently fail to register. All of
+these are now documented in the workspace-wide forensics guide, but
+the LaMa-specific lessons are recorded here.
+
+### 13a. Missing `gi.require_version()` calls
+
+**Symptom:** `PyGIWarning` at import time, plug-in not discovered.
+
+**Fix:** Add version requirements *before* importing from
+`gi.repository`:
+
+```python
+import gi
+gi.require_version('Gegl', '0.4')
+gi.require_version('Gimp', '3.0')
+gi.require_version('GimpUi', '3.0')
+
+from gi.repository import Gegl, Gimp, GimpUi, GLib, GObject
+```
+
+The warnings alone don't block discovery, but they indicate the
+import order is wrong and can cause version mismatches at runtime.
+
+### 13b. `add_choice_argument` signature
+
+**Symptom:** `Plug-in failed to create procedure` in gimp-console
+verbose output. Plug-in appears in pluginrc but menu item does
+nothing when clicked.
+
+**Wrong:**
+```python
+procedure.add_choice_argument(
+    "model", "Mo_del",
+    choice,           # missing description
+    "lama",
+    Gimp.PARAM_FLAGEMPLARY,  # wrong flag constant
+)
+```
+
+**Correct:**
+```python
+procedure.add_choice_argument(
+    "model",                          # name
+    "Mo_del",                         # label
+    "Inpainting model to use",        # description (REQUIRED)
+    choice,                           # Gimp.Choice object
+    "lama",                           # default value
+    GObject.ParamFlags.READWRITE,     # flags (not Gimp.PARAM_FLAG_*)
+)
+```
+
+Key differences:
+- **Description parameter is required** — omitting it shifts all
+  subsequent args, causing a silent type mismatch.
+- **Flags use `GObject.ParamFlags.READWRITE`**, not
+  `Gimp.PARAM_FLAGEMPLARY`. The `Gimp.PARAM_FLAG_*` constants
+  don't exist in GIMP 3.x Python bindings.
+
+### 13c. `config.get_choice()` does not exist
+
+**Symptom:** Runtime error:
+`'GimpProcedureConfigRun-plug-in-lama-inpaint' object has no attribute 'get_choice'`
+
+**Wrong:** `config.get_choice("model")`
+
+**Correct:** `config.get_property("model")`
+
+GIMP 3.x config objects use GObject's `get_property()` for all
+parameter types, including choices. There is no `get_choice()` method.
+
+### 13d. Interactive mode requires `GimpUi.ProcedureDialog`
+
+**Symptom:** Menu item appears but nothing happens when clicked.
+
+**Cause:** The `run()` method was not showing a dialog for
+`Gimp.RunMode.INTERACTIVE`. GIMP 3.x does not auto-generate dialogs
+for plug-in parameters.
+
+**Fix:**
+```python
+def run(self, procedure, run_mode, image, drawables, config, run_data):
+    if run_mode == Gimp.RunMode.INTERACTIVE:
+        dialog = GimpUi.ProcedureDialog.new(procedure, config)
+        dialog.fill(["model"])  # list of parameter names to show
+        if not dialog.run():
+            dialog.destroy()
+            return procedure.new_return_values(
+                Gimp.PDBStatusType.CANCEL, GLib.Error())
+        dialog.destroy()
+
+    model_choice = config.get_property("model")
+    return self._run_lama(procedure, run_mode, image, drawables, model_choice)
+```
+
+### 13e. Debugging checklist
+
+When a plug-in doesn't appear or doesn't respond:
+
+1. **Delete `pluginrc`** and restart GIMP to force rescan.
+2. **Run `gimp-console --verbose`** and grep for the plug-in name.
+   Look for `Querying plug-in` and `failed to create procedure`.
+3. **Check `py_compile`** — syntax errors block discovery.
+4. **Check imports** — `gi.require_version()` must precede
+   `from gi.repository import ...`.
+5. **Check `add_*_argument` signatures** — wrong arg count/type
+   causes silent failure.
+6. **Check `Gimp.main()`** — must use `sys.argv`, not hardcoded args.
+7. **Check `run()` signature** — must be
+   `(self, procedure, run_mode, image, drawables, config, data)`.
+
+---
+
+## 15. Porting LaMa safetensors to candle (2026-08)
+
+The manga model ships as a PyTorch state dict (`.safetensors`), not
+ONNX. Converting to ONNX is impossible with current tooling: PyTorch's
+ONNX exporter has no symbolic for ANY fft op (`fft_rfftn`, `fft_fft`,
+`complex`) even though ONNX has had DFT since opset 17 — see
+pytorch/pytorch#112382. DFT-matrix replacement in the exported graph is
+O(N²) and hung tracing. So: native inference via `candle-core/-nn 0.11`
+in the Rust worker, dispatched on file extension.
+
+### 15a. Verified layer-index map (big-lama, n_ds=3, n_blocks=18)
+
+Read this off the safetensors header, not from assumptions. The
+Sequential indices are:
+
+```
+0   ReflectionPad2d(3)          no params
+1   FFC_BN_ACT(4→64, k7)        bn_l only          (ratio 0/0)
+2-4 FFC_BN_ACT downsample ×3    bn_l; #4 also bn_g (last one gout=.75)
+5-22 FFCResnetBlock ×18         52 tensors each    (.75/.75)
+23  ConcatTupleLayer            NO PARAMS ← never request weights here
+24/25  ConvT(512→256)+BN       ConvT HAS bias     (+26 ReLU)
+27/28  ConvT(256→128)+BN                          (+29 ReLU)
+30/31  ConvT(128→64)+BN                           (+32 ReLU)
+33  ReflectionPad2d(3)          no params
+34  Conv2d(64→3, k7)            HAS bias           (FFC convs do NOT)
+35  Sigmoid                     no params
+```
+
+Off-by-one here cost three debug cycles: upsample base is
+`2+n_ds+n_bl+1`, final conv is that plus `n_ds*3+1`.
+
+### 15b. FFC convs are bias-free
+
+Every conv inside FFC/SpectralTransform/FourierUnit is `bias=False`
+(`conv2d_no_bias`). Only the two bookend layers (#24-style ConvT and
+#34 final conv) carry biases. Requesting a missing bias tensor aborts
+the load.
+
+### 15c. Spectral channel packing order
+
+PyTorch packs FFT real/imag as **per-channel interleaved**:
+`(re0, im0, re1, im1, …)` — stack(dim=inner)·reshape, NOT
+cat([all_re, all_im]). The trained 1×1 `conv_layer` reads that exact
+order. Mirror it on unpack (`view(b,c,2,h,m)` then split).
+
+### 15d. irfftn discards Im(DC) and Im(Nyquist)
+
+`torch.fft.irfftn` treats the spectrum as one-sided of a REAL signal:
+bins 0 and N/2 contribute their **real part only**. A full-spectrum
+IDFT reconstruction must zero those imaginary parts before mirroring,
+or errors leak through 36 BN+ReLU stages.
+
+### 15e. candle API traps (each cost a build cycle)
+
+- `matmul` is strict `(M,K)@(K,N)`; no batched-2D broadcasting. Flatten
+  leading dims yourself; output width = `rhs.dims()[0]` when rhs kept raw.
+- `transpose(a,b)` swaps ONE pair only. Contracting axis 1 of (B,C,H,W)
+  needs the double-swap route B,C,H,W → B,W,C,H → flatten → mm → invert.
+  A single swap silently contracts the wrong axis whenever H==W.
+- `narrow` returns strided views; `flip` (and any index-select) demands
+  contiguous input. Insert `.contiguous()` between narrow→flip chains.
+- Zero-channel tensors are fragile — thread the global branch as
+  `Option<Tensor>` from layer 1 until #4 actually produces global channels.
+
+### 15f. THE input contract: generators eat `img * (1 - mask)`
+
+The single most expensive bug of the port (cost a full "why is it
+just pasting white" round-trip):
+
+`saicinpainting/training/trainers/default.py` feeds the generator
+`masked_img = img * (1 - mask)` — **hole pixels are zeroed before
+inference**. A raw state-dict generator does NOT zero internally.
+The shipped `lama_fp32.onnx` works without this step only because
+its exporter baked the multiply into the graph. When we fed the raw
+image to the candle port, the model received an out-of-distribution
+input and produced flat white / saturated garbage — and worse, our
+first "ground truth" torch script replicated the same omission, so
+the wrongness matched itself and looked like a passing comparison.
+
+Rules:
+- Any new backend must apply `img * (1-mask)` before concat with the
+  mask channel (`CandleInpainter::inpaint` does this; grep for
+  `one_minus`).
+- Ground-truth harnesses must replicate the FULL preprocessing
+  contract, not just architecture + weights.
+- Tell-tale symptom of a missing preprocess step: output looks like
+  a constant fill while the reference "agrees" — both paths are
+  jointly wrong. Vary the INPUT REGIME (constant vs textured vs
+  partial masks) when validating; agreements that survive regime
+  changes are real, agreements under one regime may be shared bugs.
+
+### 15g. Verification methodology (do this FIRST next time)
+
+The loop that finally worked — run it before touching GIMP:
+
+1. Dump the safetensors header and classify every top-level index;
+   reconcile against the architecture source line-by-line.
+2. Standalone smoke test: synthetic PNG pair straight into
+   `lama-worker.exe --model <safetensors>`. No GIMP in the loop.
+3. Ground truth: run the ORIGINAL PyTorch generator (lama-main modules,
+   shim `kornia`/`pytorch_lightning` if imports fail) on IDENTICAL input
+   (full-image mask ⇒ identical preprocessing) and diff pixels — with
+   the full §15f input contract applied on BOTH sides.
+4. Acceptance seen: manga content → mean 0.28–9.9, p99 = 0 in the
+   saturated regime; bounded ≤85/255 once inputs are in-distribution
+   (float-path divergence through 18 BN blocks — expected across FFT
+   backends, no structural artifacts). Residual sub-1% bands where the
+   reference itself emits [0,255,0]-style garbage are reference chaos.
+5. Behavioral gates that actually matter to users: outside-mask pixels
+   byte-identical; fill textured (std >> 0), not constant; line work
+   continues through filled rows; output deterministic run-to-run.
+
+### 15g. Reflect padding is part of the contract (real bug found via stage bisect)
+
+FFC builds every k3/k7 conv as
+`nn.Conv2d(..., padding=N, padding_mode='reflect')`. candle's Conv2d
+only does zero padding. Zero-padded convs matched torch to ~4 decimal
+places on means while extremes diverged — and the error propagated
+inward through the FFT global path as scattered pixels (the "glitchy"
+report). Fix: manual `reflect_pad2d` pre-pad + conv with `padding: 0`
+(`RefPadConv`). After the fix, layers 1–4 match torch **exactly**
+including per-stage maxima.
+
+Diagnostic that found it: instrument BOTH backends to print per-layer
+mean/std/min/max (`LAMA_DEBUG_STAGES=1` env in the worker; forward
+hooks in torch) and walk the table until the first divergence.
+
+### 15h. This checkpoint is chaotically unstable — cross-backend pixel equality is impossible
+
+After the reflect fix, residual divergence enters at the first
+FourierUnit and grows. Evidence it is NOT a port bug:
+
+- f64 FFT bases produced bit-identical outputs to f32 → not precision.
+- **torch-f32 vs torch-f64 on identical input diverge comparably**
+  (seq5_g max 23.5 vs 36.2; final range [0.70,0.88] vs [0.17,1.0]).
+- Internal activations reach thousands regardless of input regime.
+- torch emits `[0,255,0]`-style saturated garbage on some OOD inputs;
+  our port stays smoother there.
+
+Conclusion: hot BN channels make the generator a chaotic map; any
+second implementation (different BLAS/FFT reduction order) rides a
+different trajectory of equal validity. Practical acceptance gates are
+behavioral, not bitwise: outside-mask bytes exact, fill textured,
+line-work continues, output deterministic, bounded mean|d| vs
+reference (≤~10/255 observed). For photographic content expect the
+Manga model to look speckly by nature — that is the checkpoint, not
+the port; General LaMa remains the right tool for photos.
+
+### 15i. Resolution-preserving inference for the candle path
+
+IOPaint (upstream of the anime-manga checkpoint) pads to modulo-8 at
+original resolution; it never squashes to 512². Forcing manga ROI
+through a 512² resize round-trip aliases screentone/lines into moiré
+that reads as "scattered pixels". The candle branch now:
+
+- keeps ROI resolution, reflect-padding to the next multiple of 8
+  (`MAX_SIDE 1024` cap with proportional downscale above that);
+- builds DFT bases lazily per runtime size (`FourierUnit::bases_for`),
+  since FFC is size-agnostic given /8 dims.
+
+Validation: fill Laplacian hits are 99.6% connected curve structure
+(7 isolated dots / 1907) — crisp reconstructed linework, not noise.
+The ONNX branch still resizes (fixed-size export).
+
+---
+
+## 16. See also
 
 - `AGENTS.md` at the workspace root — project conventions and
   rules.
@@ -400,5 +682,7 @@ project's source tree.
 - `lama-worker-rs/OPTIMIZATION.md` — Rust worker post-mortem.
 - `lama-worker-rs/README.md` — Rust worker build, env vars, EP
   features.
-- GIMP 3.x plug-in pitfalls (workspace root) — broader GIMP
-  development traps; this doc is LaMa-specific.
+- `C:\Dev\GIMP_Plugin\Documentation\GIMP-plugin-common-pitfalls.md`
+  — broader GIMP development traps.
+- `C:\Dev\GIMP_Plugin\Documentation\GIMP-Plugin-Connectivity-Forensics-Guide.md`
+  — systematic debugging workflow for plug-in discovery issues.

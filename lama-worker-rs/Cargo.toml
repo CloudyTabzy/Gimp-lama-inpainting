@@ -60,6 +60,13 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # postprocessing (mask composition, output write) across all cores.
 rayon = "1.10"
 
+# Candle ML framework for safetensors model inference (manga LaMa).
+candle-core = { version = "0.11", default-features = false }
+candle-nn = { version = "0.11", default-features = false }
+
+# Safetensors model loading.
+safetensors = "0.4"
+
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 

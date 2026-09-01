@@ -34,16 +34,17 @@ filled.
 | Feature | Status |
 |---|---|
 | 🖼️  GIMP 3.2 filter via Filters → Enhance menu | ✅ |
-| 🎨  Adaptive 512² ROI around the selection | ✅ |
+| 🎨  Adaptive ROI around the selection (native resolution for Manga) | ✅ |
 | 🔁  Reflect-pad crop for edge-touching selections | ✅ |
 | 🪄  Preserves pixels outside the selection byte-for-byte | ✅ |
 | 🐍  Default Python worker (no build step) | ✅ |
-| 🦀  Optional Rust worker — ~2× faster cold-start | ✅ |
+| 🦀  Optional Rust worker — ~2× faster cold-start, also runs Manga model | ✅ |
 | 🎯  GPU-ready (DirectML/CUDA behind opt-in Cargo features) | ✅ |
 | 🔌  Per-user GIMP interpreter alias — no GIMP install touched | ✅ |
 | 📦  Self-contained installer (`.bat`) | ✅ |
 | 🌐  LaMa model auto-downloaded from HuggingFace on install | ✅ |
 | 📝  Architectural docs and lessons learned included | ✅ |
+| 🎨  **Manga LaMa** — line-art finetuned model for anime/comic inpainting | ✅ |
 
 ---
 
@@ -78,49 +79,94 @@ as the Python one.
 
 ## Model
 
-The plug-in needs the LaMa inpainter model (`lama_fp32.onnx`, ~198 MB).
-It is **not** stored in the repo — `install.bat` downloads it
-transparently from HuggingFace on first run:
+The plug-in includes two models:
 
-> <https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx?download=true>
+| Model | File | Size | Domain |
+|---|---|---|---|
+| **LaMa General** | `lama_fp32.onnx` | ~198 MB | Photos, natural images |
+| **LaMa Manga** | `lama-manga.safetensors` | ~195 MB | Anime, manga, comic art |
 
-If the auto-download fails (no internet, proxy, firewall), download
-the file manually with a browser or `curl` and place it at:
+The **General** model is the standard LaMa from
+[Carve/LaMa-ONNX](https://huggingface.co/Carve/LaMa-ONNX) — good for
+photos, soft fills, background removal.
 
-```
-%APPDATA%\GIMP\3.2\plug-ins\lama-inpaint\lama_fp32.onnx
-```
+The **Manga** model is a fine-tuned Big-LaMa from
+[Sanster/anime-manga-big-lama](https://github.com/Sanster/models/releases/download/AnimeMangaInpainting/anime-manga-big-lama.pt)
+— trained on ~300,000 manga/anime images. It reconstructs sharp line
+art, screentone, and comic textures. **Not suitable for photographs**
+(it will invent manga-style line work).
 
-The plug-in will start working as soon as the file is present in
-that directory. The source-side copy
-`lama-inpainting-py/lama_fp32.onnx` is also valid — `install.bat`
-copies from there when present.
+Both are **not** stored in the repo — the installer downloads the
+General model from HuggingFace. The Manga model is available from the
+[Releases](../../releases) page.
+
+### Model selection
+
+In GIMP, run **Filters → Enhance → LaMa Inpaint...** and choose your
+model from the dropdown. The Manga option only appears when
+`lama-manga.safetensors` is present in the plug-in directory.
 
 ---
 
 ## Quick start (Windows)
+
+### Option A: Release zip (recommended)
+
+1. Download the latest `lama-inpaint-v*.zip` from the
+   [Releases](../../releases) page.
+2. Extract the zip to `%APPDATA%\GIMP\3.2\plug-ins\` so the
+   directory structure is:
+   ```
+   %APPDATA%\GIMP\3.2\plug-ins\lama-inpaint\
+   ├── lama-inpaint.py
+   ├── lama_worker.py
+   ├── lama_inpaint.py
+   ├── lama_worker_rust.exe
+   ├── lama_fp32.onnx       ← General LaMa model
+   ├── lama-manga.safetensors  ← Manga LaMa model
+   └── lama_config.json
+   ```
+3. Restart GIMP, open an image, make a selection, run
+   **Filters → Enhance → LaMa Inpaint...**.
+
+### Option B: Installer script
 
 ```cmd
 cd lama-inpainting-py
 install.bat
 ```
 
-That's it. The installer:
-
+The installer:
 1. Detects GIMP 3's bundled Python and a suitable worker Python on
    your PATH.
 2. Installs `pillow`, `numpy`, `onnxruntime` for the worker.
 3. Writes two per-user `.interp` files into
-   `%APPDATA%\GIMP\3.2\interpreters\` — a console one and a GUI one —
-   so GIMP launches the plug-in with its own Python 3.14 directly.
+   `%APPDATA%\GIMP\3.2\interpreters\`.
 4. Copies the plug-in files (Python source + model + config) to
    `%APPDATA%\GIMP\3.2\plug-ins\lama-inpaint\`.
 5. If `cargo` is on your PATH, builds the Rust sidecar and sets it as
-   the default worker. If not, the Python worker is the default —
-   the plug-in is fully functional either way.
+   the default worker. If not, the Python worker is the default.
+6. If the Manga safetensors model is found in `..\models\`, copies it
+   alongside the other files.
 
 Restart GIMP, open an image, make a selection, run
 **Filters → Enhance → LaMa Inpaint...**.
+
+### Option C: Manual install
+
+Place the plug-in directory under `%APPDATA%\GIMP\3.2\plug-ins\` with
+these files:
+
+```
+lama-inpaint/
+├── lama-inpaint.py         ← GIMP plug-in entry
+├── lama_worker.py          ← Python worker
+├── lama_inpaint.py         ← Inference core
+├── lama_config.json        ← Worker Python path
+├── lama_fp32.onnx          ← General model (download from HuggingFace)
+├── lama-manga.safetensors  ← Manga model (download from Releases)
+└── lama_worker_rust.exe    ← Rust sidecar (optional, from Releases)
+```
 
 ### Try the Rust worker manually
 

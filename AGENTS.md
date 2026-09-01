@@ -150,6 +150,18 @@ at the parent workspace directory.
 11. **If you don't know whether something is the right approach,**
     check `lama-inpainting-py/Docs/NOTES.md` first. Most mistakes
     we made were already made and documented there.
+12. **GIMP 3.x Python plug-in API is strict about signatures.** When
+    adding parameters or changing procedure registration, always:
+    - Use `gi.require_version()` before `from gi.repository import ...`
+    - Include description in `add_*_argument()` calls
+    - Use `GObject.ParamFlags.READWRITE`, not `Gimp.PARAM_FLAG_*`
+    - Use `config.get_property("name")`, not `config.get_choice("name")`
+    - Show `GimpUi.ProcedureDialog` for `INTERACTIVE` run mode
+    - Debug with `gimp-console --verbose` and check for
+      `failed to create procedure` errors
+    See `Docs/NOTES.md` §13 and
+    `C:\Dev\GIMP_Plugin\Documentation\GIMP-plugin-common-pitfalls.md`
+    for the full list.
 
 ---
 
