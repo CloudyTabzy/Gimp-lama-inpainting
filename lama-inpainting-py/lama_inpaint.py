@@ -45,17 +45,12 @@ def _resize_hwc(arr: np.ndarray, h: int, w: int, linear: bool) -> np.ndarray:
     if cv2 is not None:
         inter = cv2.INTER_LINEAR if linear else cv2.INTER_NEAREST
         return cv2.resize(arr, (w, h), interpolation=inter)
-    # numpy fallback: pure Python so the module has zero hard deps besides
-    # numpy + onnxruntime.
-    return _resize_numpy(arr, h, w, linear)
+    # numpy fallback: nearest-neighbor only (bilinear weights not implemented).
+    return _resize_numpy(arr, h, w)
 
 
-def _resize_hw(arr: np.ndarray, h: int, w: int, linear: bool) -> np.ndarray:
-    return _resize_hwc(arr, h, w, linear)
-
-
-def _resize_numpy(arr: np.ndarray, h: int, w: int, linear: bool) -> np.ndarray:
-    """Pure-numpy resize. Slower than cv2 but works without OpenCV."""
+def _resize_numpy(arr: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Pure-numpy nearest-neighbor resize. Faster than cv2 but no bilinear."""
     src_h, src_w = arr.shape[:2]
     if src_h == h and src_w == w:
         return arr.copy()
@@ -64,12 +59,10 @@ def _resize_numpy(arr: np.ndarray, h: int, w: int, linear: bool) -> np.ndarray:
     else:
         out = np.zeros((h, w), dtype=arr.dtype)
 
-    # Compute source coordinates for each output pixel
-    ys = np.linspace(0, src_h - 1, h) if linear else np.round(np.linspace(0, src_h - 1, h))
-    xs = np.linspace(0, src_w - 1, w) if linear else np.round(np.linspace(0, src_w - 1, w))
-    yi = ys.astype(np.intp)
-    xi = xs.astype(np.intp)
-    out = arr[yi[:, None], xi[None, :]]
+    # Nearest-neighbor sampling (always integer coordinates)
+    ys = np.round(np.linspace(0, src_h - 1, h)).astype(np.intp)
+    xs = np.round(np.linspace(0, src_w - 1, w)).astype(np.intp)
+    out = arr[ys[:, None], xs[None, :]]
     return out
 
 
@@ -242,7 +235,7 @@ class LamaInpainter:
 
         # 4. Resize to 512 × 512
         img_512 = _resize_hwc(img_roi, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, linear=True)
-        mask_512 = _resize_hw(mask_roi, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, linear=False)
+        mask_512 = _resize_hwc(mask_roi, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, linear=False)
         mask_512 = (mask_512 > 0.5).astype(np.float32)
 
         # 5. Inference

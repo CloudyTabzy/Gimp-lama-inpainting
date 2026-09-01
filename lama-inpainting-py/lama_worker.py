@@ -47,7 +47,7 @@ def _output_path(path: str) -> str:
     if not os.path.isdir(parent):
         raise ValueError(f"output directory not found: {parent}")
     if os.path.isdir(resolved):
-        raise ValueError("output path is a directory: {resolved}")
+        raise ValueError(f"output path is a directory: {resolved}")
     return resolved
 
 

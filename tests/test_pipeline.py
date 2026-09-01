@@ -24,6 +24,31 @@ sys.path.insert(0, str(ROOT / "lama-inpainting-py"))
 from lama_inpaint import LamaInpainter, MODEL_INPUT_SIZE  # noqa: E402
 
 
+def find_model_path() -> Path:
+    """Locate the ONNX model, searching standard locations."""
+    candidates = [
+        ROOT / "lama-inpainting-py" / "lama_fp32.onnx",
+        ROOT / "lama-worker-rs" / ".." / "lama-inpainting-py" / "lama_fp32.onnx",
+        Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32.onnx",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p.resolve()
+    return candidates[0]  # best guess, will fail with a clear error later
+
+
+def find_worker_script() -> Path:
+    """Locate the Python worker script."""
+    candidates = [
+        ROOT / "lama-inpainting-py" / "lama_worker.py",
+        Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_worker.py",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p.resolve()
+    return candidates[0]
+
+
 def gradient_image(h: int, w: int) -> np.ndarray:
     """Multi-component gradient that looks like a sky."""
     y = np.linspace(0, 1, h, dtype=np.float32).reshape(-1, 1)
@@ -181,42 +206,33 @@ def test_worker_script(inpainter):
     """Run lama_worker.py end-to-end and compare its output to inpaint()."""
     import subprocess
     import sys
+    import tempfile
     from PIL import Image
 
     img = landscape_image(1024, 1024)
     mask = make_mask(1024, 1024, (400, 400, 200, 200))
     expected = inpainter.inpaint(img, mask)
 
-    import tempfile
-    tmpdir = Path(tempfile.mkdtemp())
-    (tmpdir / "image.png").parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray((img * 255).astype(np.uint8)).save(tmpdir / "image.png")
-    Image.fromarray((mask * 255).astype(np.uint8)).save(tmpdir / "mask.png")
+    with tempfile.TemporaryDirectory(prefix="gimp-lama-test-") as td:
+        tmpdir = Path(td)
+        Image.fromarray((img * 255).astype(np.uint8)).save(tmpdir / "image.png")
+        Image.fromarray((mask * 255).astype(np.uint8)).save(tmpdir / "mask.png")
 
-    model_path = ROOT / "lama-inpainting-py" / "lama_fp32.onnx"
-    if not model_path.exists():
-        model_path = ROOT / "lama-worker-rs" / ".." / "lama-inpainting-py" / "lama_fp32.onnx"
-    if not model_path.exists():
-        # Try the installed plug-in copy
-        model_path = Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32.onnx"
-
-    worker_script = ROOT / "lama-inpainting-py" / "lama_worker.py"
-    if not worker_script.exists():
-        worker_script = Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_worker.py"
-
-    python_exe = sys.executable
-    r = subprocess.run(
-        [python_exe, str(worker_script),
-         "--image", str(tmpdir / "image.png"),
-         "--mask", str(tmpdir / "mask.png"),
-         "--output", str(tmpdir / "result.png"),
-         "--model", str(model_path)],
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"worker failed: {r.stderr}"
-    actual = np.array(Image.open(tmpdir / "result.png").convert("RGB")) / 255.0
-    np.testing.assert_allclose(actual, expected, atol=0.01)
-    print("  ok  worker script end-to-end: max RGB error=0, alpha preserved")
+        model_path = find_model_path()
+        worker_script = find_worker_script()
+        python_exe = sys.executable
+        r = subprocess.run(
+            [python_exe, str(worker_script),
+             "--image", str(tmpdir / "image.png"),
+             "--mask", str(tmpdir / "mask.png"),
+             "--output", str(tmpdir / "result.png"),
+             "--model", str(model_path)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, f"worker failed: {r.stderr}"
+        actual = np.array(Image.open(tmpdir / "result.png").convert("RGB")) / 255.0
+        np.testing.assert_allclose(actual, expected, atol=0.01)
+    print("  ok  worker script end-to-end: max RGB diff < 0.01, alpha preserved")
 
 
 def test_rust_worker_script(inpainter):
@@ -237,44 +253,43 @@ def test_rust_worker_script(inpainter):
     expected = inpainter.inpaint(img, mask)
 
     import tempfile
-    tmpdir = Path(tempfile.mkdtemp())
-    Image.fromarray((img * 255).astype(np.uint8)).save(tmpdir / "image.png")
-    Image.fromarray((mask * 255).astype(np.uint8)).save(tmpdir / "mask.png")
+    with tempfile.TemporaryDirectory(prefix="gimp-lama-test-") as td:
+        tmpdir = Path(td)
+        Image.fromarray((img * 255).astype(np.uint8)).save(tmpdir / "image.png")
+        Image.fromarray((mask * 255).astype(np.uint8)).save(tmpdir / "mask.png")
 
-    # PIL gives u8 RGB; the Rust worker expects u8 RGBA, so use RGBA
-    img_rgba = np.zeros((1024, 1024, 4), dtype=np.uint8)
-    img_rgba[:, :, :3] = (img * 255).astype(np.uint8)
-    img_rgba[:, :, 3] = 255
-    Image.fromarray(img_rgba, mode="RGBA").save(tmpdir / "image.png")
+        # PIL gives u8 RGB; the Rust worker expects u8 RGBA, so use RGBA
+        img_rgba = np.zeros((1024, 1024, 4), dtype=np.uint8)
+        img_rgba[:, :, :3] = (img * 255).astype(np.uint8)
+        img_rgba[:, :, 3] = 255
+        Image.fromarray(img_rgba, mode="RGBA").save(tmpdir / "image.png")
 
-    model_path = ROOT / "lama-inpainting-py" / "lama_fp32.onnx"
-    if not model_path.exists():
-        model_path = Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32.onnx"
+        model_path = find_model_path()
 
-    r = subprocess.run(
-        [str(rust_bin),
-         "--image", str(tmpdir / "image.png"),
-         "--mask", str(tmpdir / "mask.png"),
-         "--output", str(tmpdir / "result.png"),
-         "--model", str(model_path)],
-        capture_output=True, text=True,
-    )
-    assert r.returncode == 0, f"rust worker failed: stdout={r.stdout}\nstderr={r.stderr}"
+        r = subprocess.run(
+            [str(rust_bin),
+             "--image", str(tmpdir / "image.png"),
+             "--mask", str(tmpdir / "mask.png"),
+             "--output", str(tmpdir / "result.png"),
+             "--model", str(model_path)],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, f"rust worker failed: stdout={r.stdout}\nstderr={r.stderr}"
 
-    out_rgba = np.array(Image.open(tmpdir / "result.png").convert("RGBA"))
-    # Compare RGB only (alpha is preserved byte-exact by both workers)
-    actual = out_rgba[:, :, :3].astype(np.float32) / 255.0
-    expected_rgb = expected
+        out_rgba = np.array(Image.open(tmpdir / "result.png").convert("RGBA"))
+        # Compare RGB only (alpha is preserved byte-exact by both workers)
+        actual = out_rgba[:, :, :3].astype(np.float32) / 255.0
+        expected_rgb = expected
 
-    # The Rust worker may use a different EP with slightly different
-    # floating-point behavior, so allow a wider tolerance.
-    rgb_error = np.abs(actual - expected_rgb).max()
-    assert rgb_error <= 20, (
-        f"rust/direct RGB differ by {rgb_error} levels; expected at most 20"
-    )
-    assert np.array_equal(out_rgba[:, :, 3], img_rgba[:, :, 3]), (
-        "rust worker output alpha must exactly match input alpha"
-    )
+        # The Rust worker may use a different EP with slightly different
+        # floating-point behavior, so allow a wider tolerance.
+        rgb_error = np.abs(actual - expected_rgb).max()
+        assert rgb_error <= 20, (
+            f"rust/direct RGB differ by {rgb_error} levels; expected at most 20"
+        )
+        assert np.array_equal(out_rgba[:, :, 3], img_rgba[:, :, 3]), (
+            "rust worker output alpha must exactly match input alpha"
+        )
     print(
         f"  ok  rust worker end-to-end: "
         f"max RGB error={int(rgb_error)}, alpha preserved"
@@ -296,9 +311,7 @@ def main():
     import tempfile
     tmp_dir = Path(tempfile.mkdtemp())
     print("Loading model...")
-    model_path = ROOT / "lama-inpainting-py" / "lama_fp32.onnx"
-    if not model_path.exists():
-        model_path = Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32.onnx"
+    model_path = find_model_path()
     print(f"  model: {model_path}")
     inpainter = LamaInpainter(str(model_path))
     print(f"  input size: {MODEL_INPUT_SIZE}")

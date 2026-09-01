@@ -405,7 +405,9 @@ fn preprocess(
     }
     let sel_w = sel_x2 - sel_x1 + 1;
     let sel_h = sel_y2 - sel_y1 + 1;
-    let ctx = std::cmp::max(1, (std::cmp::max(sel_w, sel_h) as f32).round() as usize);
+    // Match the Python worker: at least 128 px of context regardless of
+    // selection size (this also keeps the FFC global field receptive).
+    let ctx = std::cmp::max(128, (std::cmp::max(sel_w, sel_h) as f32).round() as usize);
     let roi_x1 = sel_x1 as i64 - ctx as i64;
     let roi_y1 = sel_y1 as i64 - ctx as i64;
     let roi_w = sel_w + 2 * ctx;
@@ -456,11 +458,9 @@ fn postprocess(
     let real_y2 = real_y1 + (y2 - y1);
     let real_x2 = real_x1 + (x2 - x1);
     let mut result = image.clone();
-    let mut sub = result.slice_mut(s![y1..y2, x1..x2, ..]).to_owned();
-    sub.assign(&composed_roi.slice(s![real_y1..real_y2, real_x1..real_x2, ..]));
     result
         .slice_mut(s![y1..y2, x1..x2, ..])
-        .assign(&sub);
+        .assign(&composed_roi.slice(s![real_y1..real_y2, real_x1..real_x2, ..]));
     Ok(result)
 }
 
@@ -554,188 +554,6 @@ fn run_ort_inpaint(
     postprocess(&out_hwc_512, image, roi)
 }
 
-/// Core inpainting routine. Mirrors the Python `LamaInpainter.inpaint`
-/// step-for-step: bbox -> context pad -> reflect-pad crop -> 512x512
-/// resize -> single inference -> resize back -> mask composition -> paste.
-fn inpaint(
-    session: &mut Session,
-    image: &Array3<f32>,
-    mask: &Array2<bool>,
-) -> Result<Array3<f32>> {
-    let (height, width) = (image.dim().0, image.dim().1);
-
-    // 1. Selection bbox.
-    if mask.iter().all(|v| !*v) {
-        return Ok(image.clone());
-    }
-    let mut sel_x1 = width;
-    let mut sel_y1 = height;
-    let mut sel_x2: usize = 0;
-    let mut sel_y2: usize = 0;
-    for y in 0..height {
-        for x in 0..width {
-            if mask[[y, x]] {
-                if x < sel_x1 {
-                    sel_x1 = x;
-                }
-                if y < sel_y1 {
-                    sel_y1 = y;
-                }
-                if x >= sel_x2 {
-                    sel_x2 = x;
-                }
-                if y >= sel_y2 {
-                    sel_y2 = y;
-                }
-            }
-        }
-    }
-    let sel_w = sel_x2 - sel_x1 + 1;
-    let sel_h = sel_y2 - sel_y1 + 1;
-
-    // 2. Padded ROI bbox (one context-size on each side).
-    let ctx = std::cmp::max(1, (std::cmp::max(sel_w, sel_h) as f32).round() as usize);
-    let roi_x1 = sel_x1 as i64 - ctx as i64;
-    let roi_y1 = sel_y1 as i64 - ctx as i64;
-    let roi_w = sel_w + 2 * ctx;
-    let roi_h = sel_h + 2 * ctx;
-
-    // 3. Crop with reflect-pad if ROI extends past image bounds.
-    let (img_roi, mask_roi, paste_box) =
-        crop_with_reflect_pad(image, mask, roi_x1, roi_y1, roi_w, roi_h);
-
-    // 4. Resize to 512x512. The source mask is already a 0/1 bool;
-    //    nearest-neighbor resize of a bool keeps it binary, so we do
-    //    not re-threshold here (the Python re-threshold is a no-op for
-    //    binary masks and the input is already binary).
-    let img_512 = resize_bilinear_hwc(&img_roi, MODEL_INPUT, MODEL_INPUT);
-    let mask_512 = resize_nearest_hw(&mask_roi, MODEL_INPUT, MODEL_INPUT);
-
-    // 5. Inference. The model has two inputs in the order declared by
-    // `session.inputs()`: image then mask (1x3x512x512 and 1x1x512x512).
-    let input_names: Vec<String> = session
-        .inputs()
-        .iter()
-        .map(|o| o.name().to_string())
-        .collect();
-    if input_names.len() != 2 {
-        bail!(
-            "expected exactly 2 ORT inputs, got {}",
-            input_names.len()
-        );
-    }
-    let output_name = session
-        .outputs()
-        .first()
-        .map(|o| o.name().to_string())
-        .ok_or_else(|| anyhow!("ORT session has no outputs"))?;
-
-    let img_chw: Array4<f32> = {
-        let mut arr = Array4::<f32>::zeros((1, 3, MODEL_INPUT, MODEL_INPUT));
-        arr.axis_iter_mut(Axis(2))
-            .enumerate()
-            .par_bridge()
-            .for_each(|(y, mut row)| {
-                for x in 0..MODEL_INPUT {
-                    for ch in 0..3 {
-                        row[[0, ch, x]] = img_512[[y, x, ch]];
-                    }
-                }
-            });
-        arr
-    };
-    let mask_chw: Array4<f32> = {
-        let mut arr = Array4::<f32>::zeros((1, 1, MODEL_INPUT, MODEL_INPUT));
-        arr.axis_iter_mut(Axis(2))
-            .enumerate()
-            .par_bridge()
-            .for_each(|(y, mut row)| {
-                for x in 0..MODEL_INPUT {
-                    row[[0, 0, x]] = if mask_512[[y, x]] { 1.0_f32 } else { 0.0_f32 };
-                }
-            });
-        arr
-    };
-
-    let outputs = session
-        .run(inputs![
-            input_names[0].as_str() => TensorRef::from_array_view(img_chw.view())?,
-            input_names[1].as_str() => TensorRef::from_array_view(mask_chw.view())?,
-        ])
-        .map_err(|e| anyhow!("ORT run failed: {}", e))?;
-
-    let out_view = outputs
-        .get(output_name.as_str())
-        .ok_or_else(|| anyhow!("ORT output `{}` missing", output_name))?
-        .try_extract_array::<f32>()
-        .map_err(|e| anyhow!("ORT output extraction failed: {}", e))?;
-    // out_view shape: (1, 3, 512, 512)
-    let out_4d = out_view.to_owned();
-    drop(outputs); // release borrow before allocating
-
-    // 6. Convert CHW -> HWC, divide by 255 (model outputs in 0..=255),
-    //    clip to [0, 1]. Per-row parallel.
-    let out_hwc_512: Array3<f32> = {
-        let shape = out_4d.shape().to_vec();
-        if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
-            bail!(
-                "unexpected ORT output shape {:?}; expected (1, 3, H, W)",
-                shape
-            );
-        }
-        let (h, w) = (shape[2], shape[3]);
-        let inv_255 = 1.0_f32 / 255.0;
-        let mut hwc = Array3::<f32>::zeros((h, w, 3));
-        hwc.axis_iter_mut(Axis(0))
-            .enumerate()
-            .par_bridge()
-            .for_each(|(y, mut row)| {
-                for x in 0..w {
-                    for ch in 0..3 {
-                        let v = out_4d[[0, ch, y, x]] * inv_255;
-                        row[[x, ch]] = if v < 0.0 { 0.0 } else if v > 1.0 { 1.0 } else { v };
-                    }
-                }
-            });
-        hwc
-    };
-
-    // 7. Resize output back to ROI size, then mask-compose: keep the
-    //    original image outside the mask, the model output inside.
-    let out_roi = resize_bilinear_hwc(&out_hwc_512, roi_h, roi_w);
-    let mut composed_roi = out_roi.clone();
-    composed_roi
-        .axis_iter_mut(Axis(0))
-        .enumerate()
-        .par_bridge()
-        .for_each(|(y, mut row)| {
-            for x in 0..roi_w {
-                if !mask_roi[[y, x]] {
-                    for ch in 0..3 {
-                        row[[x, ch]] = img_roi[[y, x, ch]];
-                    }
-                }
-            }
-        });
-
-    // 8. Paste back into the original image, skipping the reflect-pad
-    //    region. `paste_box` is the (y1, y2, x1, x2) of the valid
-    //    (non-pad) region in the original image coordinates.
-    let (y1, y2, x1, x2) = paste_box;
-    let real_y1 = (std::cmp::max(0, -roi_y1)) as usize;
-    let real_x1 = (std::cmp::max(0, -roi_x1)) as usize;
-    let real_y2 = real_y1 + (y2 - y1);
-    let real_x2 = real_x1 + (x2 - x1);
-    let mut result = image.clone();
-    let mut sub = result
-        .slice_mut(s![y1..y2, x1..x2, ..])
-        .to_owned();
-    sub.assign(&composed_roi.slice(s![real_y1..real_y2, real_x1..real_x2, ..]));
-    result
-        .slice_mut(s![y1..y2, x1..x2, ..])
-        .assign(&sub);
-    Ok(result)
-}
 
 fn crop_with_reflect_pad(
     image: &Array3<f32>,

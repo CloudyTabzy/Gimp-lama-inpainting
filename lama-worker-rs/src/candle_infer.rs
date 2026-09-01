@@ -554,6 +554,9 @@ fn reflect_pad2d(x: &Tensor, p: usize) -> Result<Tensor> {
 
 impl CandleInpainter {
     pub fn from_safetensors(model_path: &Path, device: &Device) -> Result<Self> {
+        // SAFETY: rom_mmaped_safetensors memory-maps the file. The model
+        // file must not be modified for the VarBuilder's lifetime, and the
+        // file is a trusted checkpoint (not attacker-controlled).
         let vb = unsafe {
             candle_nn::VarBuilder::from_mmaped_safetensors(&[model_path], DType::F32, device)
                 .map_err(|e| anyhow::anyhow!("{}", e))?
