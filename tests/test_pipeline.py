@@ -27,8 +27,11 @@ from lama_inpaint import LamaInpainter, MODEL_INPUT_SIZE  # noqa: E402
 def find_model_path() -> Path:
     """Locate the ONNX model, searching standard locations."""
     candidates = [
+        ROOT / "lama-inpainting-py" / "lama_fp32_dynamic.onnx",
         ROOT / "lama-inpainting-py" / "lama_fp32.onnx",
+        ROOT / "lama-worker-rs" / ".." / "lama-inpainting-py" / "lama_fp32_dynamic.onnx",
         ROOT / "lama-worker-rs" / ".." / "lama-inpainting-py" / "lama_fp32.onnx",
+        Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32_dynamic.onnx",
         Path(os.environ.get("APPDATA", "")) / "GIMP" / "3.2" / "plug-ins" / "lama-inpaint" / "lama_fp32.onnx",
     ]
     for p in candidates:
@@ -231,8 +234,11 @@ def test_worker_script(inpainter):
         )
         assert r.returncode == 0, f"worker failed: {r.stderr}"
         actual = np.array(Image.open(tmpdir / "result.png").convert("RGB")) / 255.0
-        np.testing.assert_allclose(actual, expected, atol=0.01)
-    print("  ok  worker script end-to-end: max RGB diff < 0.01, alpha preserved")
+        # The dynamic model path produces slightly different results due to
+        # resolution-preserving inference (no 512² squash). Allow a wider
+        # tolerance than the old fixed-512 path.
+        np.testing.assert_allclose(actual, expected, atol=0.05)
+    print("  ok  worker script end-to-end: max RGB diff < 0.05, alpha preserved")
 
 
 def test_rust_worker_script(inpainter):

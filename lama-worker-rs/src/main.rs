@@ -29,8 +29,11 @@ mod candle_infer;
 
 /// Fixed LaMa ONNX input spatial size. The model was exported at 512x512.
 const MODEL_INPUT: usize = 512;
-/// Mask threshold in 0..=255. Pixels strictly above become "inpaint".
-const MASK_THRESHOLD: u8 = 127;
+/// Mask threshold in 0..=255. Any nonzero pixel becomes "inpaint",
+/// matching the reference LaMa behavior (predict.py: `(mask > 0) * 1`).
+/// GIMP's antialiased selection edges produce values 1–127, which
+/// must be treated as masked for correct edge blending.
+const MASK_THRESHOLD: u8 = 0;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -166,8 +169,10 @@ fn run_inpaint(args: &Args) -> Result<()> {
         .extension()
         .map_or(false, |e| e == "safetensors");
 
-    // ONNX path: fixed 512×512 export → must resize.
-    let (img_512, mask_512, roi_info) = preprocess(&image_hwc, &mask)?;
+    // Preprocess: bbox → context pad → reflect-pad crop. Returns the ROI
+    // in original resolution; the caller decides whether to resize (candle)
+    // or pad-to-mod-8 (ONNX with dynamic H/W).
+    let (_img_roi, _mask_roi, roi_info) = preprocess(&image_hwc, &mask)?;
 
     let result_hwc = if use_candle {
         marker("provider");
@@ -193,14 +198,15 @@ fn run_inpaint(args: &Args) -> Result<()> {
         );
         let img_s = if scale < 1.0 { resize_bilinear_hwc(&img_roi, sh, sw) } else { img_roi };
         let mask_s = if scale < 1.0 { resize_nearest_hw(&mask_roi, sh, sw) } else { mask_roi };
-        // Guard: keep the /8-padded side >= 32 so the /8 bottleneck stays
-        // >= 4 px (the spectral inverse needs width > its onesided half).
-        let ph8 = (((sh + 7) / 8 * 8).max(32));
-        let pw8 = (((sw + 7) / 8 * 8).max(32));
-        let pt = (ph8 - sh) / 2;
-        let pl = (pw8 - sw) / 2;
-        let img_pad = reflect_pad_3d(&img_s, pt, pl, ph8 - sh - pt, pw8 - sw - pl);
-        let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph8 - sh - pt, pw8 - sw - pl);
+        // Guard: pad to multiple of 16 so the /8 bottleneck stays even
+        // (the spectral inverse needs an even width for the onesided half).
+        // Also keep the padded side >= 32 so the bottleneck stays >= 4 px.
+        let ph16 = (((sh + 15) / 16 * 16).max(32));
+        let pw16 = (((sw + 15) / 16 * 16).max(32));
+        let pt = (ph16 - sh) / 2;
+        let pl = (pw16 - sw) / 2;
+        let img_pad = reflect_pad_3d(&img_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+        let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
         let img_chw = hwc_to_chw_tensor(&img_pad, &device)?;
         let mask_chw = mask_to_chw_tensor(&mask_pad, &device)?;
         let out = model
@@ -225,7 +231,7 @@ fn run_inpaint(args: &Args) -> Result<()> {
             })?;
         marker("provider");
         tracing::info!("provider: {}", provider_name);
-        run_ort_inpaint(&mut session, &image_hwc, &mask, &img_512, &mask_512, &roi_info)?
+        run_ort_inpaint(&mut session, &image_hwc, &mask, &roi_info)?
     };
     let inference_secs = inference_start.elapsed().as_secs_f32();
     marker("inference_done");
@@ -382,7 +388,9 @@ struct RoiInfo {
     mask_roi: Array2<bool>,
 }
 
-/// Preprocess: bbox → context pad → reflect-pad crop → resize to 512×512.
+/// Preprocess: bbox → context pad → reflect-pad crop. Returns the ROI
+/// in original resolution; the caller decides whether to resize (candle)
+/// or pad-to-mod-8 (ONNX with dynamic H/W).
 fn preprocess(
     image: &Array3<f32>,
     mask: &Array2<bool>,
@@ -414,19 +422,19 @@ fn preprocess(
     let roi_h = sel_h + 2 * ctx;
     let (img_roi, mask_roi, paste_box) =
         crop_with_reflect_pad(image, mask, roi_x1, roi_y1, roi_w, roi_h);
-    let img_512 = resize_bilinear_hwc(&img_roi, MODEL_INPUT, MODEL_INPUT);
-    let mask_512 = resize_nearest_hw(&mask_roi, MODEL_INPUT, MODEL_INPUT);
+    let img_roi_clone = img_roi.clone();
+    let mask_roi_clone = mask_roi.clone();
     Ok((
-        img_512,
-        mask_512,
+        img_roi,
+        mask_roi,
         RoiInfo {
             roi_x1,
             roi_y1,
             roi_w,
             roi_h,
             paste_box,
-            img_roi,
-            mask_roi,
+            img_roi: img_roi_clone,
+            mask_roi: mask_roi_clone,
         },
     ))
 }
@@ -464,15 +472,40 @@ fn postprocess(
     Ok(result)
 }
 
-/// ORT inference path: convert to CHW, run session, convert back.
+/// ORT inference path: resolution-preserving, pad-to-mod-8.
+/// The dynamic ONNX model accepts any H,W divisible by 8. We pad the
+/// ROI to /8 (scaling down only above a 1024-px cap), run inference,
+/// crop the pad, and upscale back if needed.
 fn run_ort_inpaint(
     session: &mut Session,
     image: &Array3<f32>,
-    mask: &Array2<bool>,
-    img_512: &Array3<f32>,
-    mask_512: &Array2<bool>,
+    _mask: &Array2<bool>,
     roi: &RoiInfo,
 ) -> Result<Array3<f32>> {
+    const MAX_SIDE: usize = 1024;
+    let (img_roi, mask_roi) = (roi.img_roi.clone(), roi.mask_roi.clone());
+    let (rh, rw) = (img_roi.dim().0, img_roi.dim().1);
+    let scale = if rh.max(rw) > MAX_SIDE {
+        MAX_SIDE as f32 / rh.max(rw) as f32
+    } else {
+        1.0
+    };
+    let (sh, sw) = (
+        ((rh as f32 * scale).round() as usize).max(1),
+        ((rw as f32 * scale).round() as usize).max(1),
+    );
+    let img_s = if scale < 1.0 { resize_bilinear_hwc(&img_roi, sh, sw) } else { img_roi };
+    let mask_s = if scale < 1.0 { resize_nearest_hw(&mask_roi, sh, sw) } else { mask_roi };
+    // Guard: pad to multiple of 16 so the /8 bottleneck stays even
+    // (the spectral inverse needs an even width for the onesided half).
+    // Also keep the padded side >= 32 so the bottleneck stays >= 4 px.
+    let ph16 = (((sh + 15) / 16 * 16).max(32));
+    let pw16 = (((sw + 15) / 16 * 16).max(32));
+    let pt = (ph16 - sh) / 2;
+    let pl = (pw16 - sw) / 2;
+    let img_pad = reflect_pad_3d(&img_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+    let mask_pad = reflect_pad_2d(&mask_s, pt, pl, ph16 - sh - pt, pw16 - sw - pl);
+
     let input_names: Vec<String> = session
         .inputs()
         .iter()
@@ -488,27 +521,27 @@ fn run_ort_inpaint(
         .ok_or_else(|| anyhow!("ORT session has no outputs"))?;
 
     let img_chw: Array4<f32> = {
-        let mut arr = Array4::<f32>::zeros((1, 3, MODEL_INPUT, MODEL_INPUT));
+        let mut arr = Array4::<f32>::zeros((1, 3, ph16, pw16));
         arr.axis_iter_mut(Axis(2))
             .enumerate()
             .par_bridge()
             .for_each(|(y, mut row)| {
-                for x in 0..MODEL_INPUT {
+                for x in 0..pw16 {
                     for ch in 0..3 {
-                        row[[0, ch, x]] = img_512[[y, x, ch]];
+                        row[[0, ch, x]] = img_pad[[y, x, ch]];
                     }
                 }
             });
         arr
     };
     let mask_chw: Array4<f32> = {
-        let mut arr = Array4::<f32>::zeros((1, 1, MODEL_INPUT, MODEL_INPUT));
+        let mut arr = Array4::<f32>::zeros((1, 1, ph16, pw16));
         arr.axis_iter_mut(Axis(2))
             .enumerate()
             .par_bridge()
             .for_each(|(y, mut row)| {
-                for x in 0..MODEL_INPUT {
-                    row[[0, 0, x]] = if mask_512[[y, x]] { 1.0_f32 } else { 0.0_f32 };
+                for x in 0..pw16 {
+                    row[[0, 0, x]] = if mask_pad[[y, x]] { 1.0_f32 } else { 0.0_f32 };
                 }
             });
         arr
@@ -529,7 +562,7 @@ fn run_ort_inpaint(
     let out_4d = out_view.to_owned();
     drop(outputs);
 
-    let out_hwc_512: Array3<f32> = {
+    let out_hwc_padded: Array3<f32> = {
         let shape = out_4d.shape().to_vec();
         if shape.len() != 4 || shape[0] != 1 || shape[1] != 3 {
             bail!("unexpected ORT output shape {:?}", shape);
@@ -551,7 +584,17 @@ fn run_ort_inpaint(
         hwc
     };
 
-    postprocess(&out_hwc_512, image, roi)
+    // Crop the pad border and undo the optional downscale
+    let mut out_hwc = out_hwc_padded
+        .slice(ndarray::s![pt..pt + sh, pl..pl + sw, ..])
+        .to_owned();
+    let out_roi_size = if scale < 1.0 {
+        resize_bilinear_hwc(&out_hwc, rh, rw)
+    } else {
+        out_hwc
+    };
+
+    postprocess(&out_roi_size, image, roi)
 }
 
 
@@ -660,13 +703,12 @@ fn reflect_pad_3d(
     out
 }
 
-/// Bilinear resize of an HWC f32 array to (new_h, new_w). The
-/// algorithm is the same as OpenCV's `INTER_LINEAR` (no half-pixel
-/// adjustment): for each output pixel (j, i), the source coordinates
-/// are `fx = j * (src_w / dst_w)` and `fy = i * (src_h / dst_h)`, with
-/// the standard four-tap blend. Weights are precomputed once per row
-/// and column to keep the inner loop branch-free, and the per-row
-/// loop body is parallelized across cores via rayon.
+/// Bilinear resize of an HWC f32 array to (new_h, new_w). Matches
+/// OpenCV's `INTER_LINEAR` / PyTorch `align_corners=False`: output
+/// pixel (ny, nx) samples source at `src_y = (ny + 0.5) * (h/new_h) - 0.5`.
+/// Weights are precomputed once per row and column to keep the inner
+/// loop branch-free, and the per-row loop body is parallelized across
+/// cores via rayon.
 fn resize_bilinear_hwc(src: &Array3<f32>, new_h: usize, new_w: usize) -> Array3<f32> {
     let (h, w, c) = (src.dim().0, src.dim().1, src.dim().2);
     if h == new_h && w == new_w {
@@ -679,14 +721,15 @@ fn resize_bilinear_hwc(src: &Array3<f32>, new_h: usize, new_w: usize) -> Array3<
         .enumerate()
         .par_bridge()
         .for_each(|(ny, mut row)| {
-            let fy = ny as f32 * sy;
-            let y0 = (fy as i64).clamp(0, (h as i64) - 1) as usize;
+            // Half-pixel-center mapping (OpenCV / PyTorch align_corners=False)
+            let fy = (ny as f32 + 0.5) * sy - 0.5;
+            let y0 = (fy.floor() as i64).clamp(0, (h as i64) - 1) as usize;
             let y1 = (y0 + 1).min(h - 1);
             let wy = (fy - y0 as f32).clamp(0.0, 1.0);
             let inv_wy = 1.0 - wy;
             for nx in 0..new_w {
-                let fx = nx as f32 * sx;
-                let x0 = (fx as i64).clamp(0, (w as i64) - 1) as usize;
+                let fx = (nx as f32 + 0.5) * sx - 0.5;
+                let x0 = (fx.floor() as i64).clamp(0, (w as i64) - 1) as usize;
                 let x1 = (x0 + 1).min(w - 1);
                 let wx = (fx - x0 as f32).clamp(0.0, 1.0);
                 let inv_wx = 1.0 - wx;
@@ -704,8 +747,9 @@ fn resize_bilinear_hwc(src: &Array3<f32>, new_h: usize, new_w: usize) -> Array3<
     out
 }
 
-/// Nearest-neighbor resize of an HW array of bools. Parallelized
-/// across rows with rayon.
+/// Nearest-neighbor resize of an HW array of bools. Uses half-pixel-
+/// center mapping to match the bilinear path. Parallelized across
+/// rows with rayon.
 fn resize_nearest_hw(src: &Array2<bool>, new_h: usize, new_w: usize) -> Array2<bool> {
     let (h, w) = (src.dim().0, src.dim().1);
     if h == new_h && w == new_w {
@@ -718,9 +762,9 @@ fn resize_nearest_hw(src: &Array2<bool>, new_h: usize, new_w: usize) -> Array2<b
         .enumerate()
         .par_bridge()
         .for_each(|(ny, mut row)| {
-            let oy = ((ny as f32 * sy) as usize).min(h - 1);
+            let oy = (((ny as f32 + 0.5) * sy) as usize).min(h - 1);
             for nx in 0..new_w {
-                let ox = ((nx as f32 * sx) as usize).min(w - 1);
+                let ox = (((nx as f32 + 0.5) * sx) as usize).min(w - 1);
                 row[[nx]] = src[[oy, ox]];
             }
         });

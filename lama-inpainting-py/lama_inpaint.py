@@ -203,7 +203,9 @@ class LamaInpainter:
         mask = np.asarray(mask, dtype=np.float32)
         if mask.ndim == 3:
             mask = mask[:, :, 0]
-        mask = (mask > 0.5).astype(np.float32)
+        # Match reference LaMa: any nonzero pixel is masked (predict.py: `(mask > 0) * 1`)
+        # GIMP's antialiased selection edges produce values 0.0–0.5 which must be masked.
+        mask = (mask > 0).astype(np.float32)
 
         H, W = image.shape[:2]
         if mask.shape != (H, W):
@@ -233,23 +235,40 @@ class LamaInpainter:
             image, mask, roi_x1, roi_y1, roi_w, roi_h
         )
 
-        # 4. Resize to 512 × 512
-        img_512 = _resize_hwc(img_roi, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, linear=True)
-        mask_512 = _resize_hwc(mask_roi, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, linear=False)
-        mask_512 = (mask_512 > 0.5).astype(np.float32)
+        # 4. Pad ROI to multiple of 16 (the FFC spectral layers need /8
+        #    with an even bottleneck for the onesided spectral inverse).
+        #    We scale down only if the ROI exceeds MAX_SIDE to bound memory.
+        MAX_SIDE = 1024
+        scale = min(1.0, MAX_SIDE / max(roi_h, roi_w))
+        sh, sw = max(1, int(round(roi_h * scale))), max(1, int(round(roi_w * scale)))
+        img_s = _resize_hwc(img_roi, sh, sw, linear=True) if scale < 1.0 else img_roi
+        mask_s = _resize_hwc(mask_roi, sh, sw, linear=False) if scale < 1.0 else mask_roi
+        # Guard: keep the /16-padded side >= 32 so the /8 bottleneck stays
+        # >= 4 px (the spectral inverse needs width > its onesided half).
+        ph16 = max(32, (sh + 15) // 16 * 16)
+        pw16 = max(32, (sw + 15) // 16 * 16)
+        pt = (ph16 - sh) // 2
+        pl = (pw16 - sw) // 2
+        img_pad = np.pad(
+            img_s, ((pt, ph16 - sh - pt), (pl, pw16 - sw - pl), (0, 0)), mode="reflect"
+        )
+        mask_pad = np.pad(
+            mask_s, ((pt, ph16 - sh - pt), (pl, pw16 - sw - pl)), mode="reflect"
+        )
 
         # 5. Inference
-        img_chw = img_512.transpose(2, 0, 1)[None, ...]  # (1, 3, 512, 512)
-        mask_chw = mask_512[None, None, :, :]  # (1, 1, 512, 512)
+        img_chw = img_pad.transpose(2, 0, 1)[None, ...]  # (1, 3, ph16, pw16)
+        mask_chw = mask_pad[None, None, :, :]  # (1, 1, ph16, pw16)
         out = self.session.run(
             [self._output_name],
             {self._input_names[0]: img_chw, self._input_names[1]: mask_chw},
         )[0]
-        out_512 = out[0].transpose(1, 2, 0) / 255.0  # (512, 512, 3) in [0, 1]
-        out_512 = np.clip(out_512, 0.0, 1.0)
+        out_padded = out[0].transpose(1, 2, 0) / 255.0  # (ph16, pw16, 3) in [0, 1]
+        out_padded = np.clip(out_padded, 0.0, 1.0)
 
-        # 6. Resize output back to ROI size
-        out_roi = _resize_hwc(out_512, roi_h, roi_w, linear=True)
+        # 6. Crop pad border and resize back to ROI size if we scaled down
+        out_cropped = out_padded[pt : pt + sh, pl : pl + sw, :]
+        out_roi = _resize_hwc(out_cropped, roi_h, roi_w, linear=True) if scale < 1.0 else out_cropped
         out_roi = np.clip(out_roi, 0.0, 1.0)
 
         # 7. Masked composition: model's output only inside the mask
