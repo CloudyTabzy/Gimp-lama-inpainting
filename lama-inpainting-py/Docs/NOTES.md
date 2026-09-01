@@ -390,6 +390,11 @@ filter plug-in. The whole `RealEsrganUpscaler` class, the DAT model,
 and the `--mode upscale` worker dispatch have been removed from this
 project's source tree.
 
+(This section is kept as historical documentation. The Detail Enhance
+filter is **not part of this project** — it belongs to a separate
+project that was never started. The path above is external to the
+repo and may not exist on disk.)
+
 ---
 
 ## 13. GIMP 3.x Python plug-in registration pitfalls (2026-08)

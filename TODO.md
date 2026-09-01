@@ -1,22 +1,6 @@
-# TODO
+# TODO — LaMa Inpainting
 
-Pending work tracked across the project. Format: `- [ ] <item>`
-plus the file/place where it belongs.
-
-## ZITS-PlusPlus / ZITS inpainting (deferred, not pursuing)
-
-- [x] ZITS++ and ZITS inpainting repos deleted from
-      `C:\Dev\GIMP_Native_Plugin\` (2026-07-28). Reasoning recorded in
-      `GOAL-Detail-Enhance-Plugin.md` and session log. Do not re-fetch.
-
-## Detail-enhance filter (separate, deferred)
-
-- [ ] Implement `Filters > Enhance > Detail Enhance...` as a GIMP filter
-      separate from inpainting. Uses DAT x4 ONNX model (already
-      exported at `DAT-main/`). Full spec in
-      `C:\Dev\GIMP_Native_Plugin\GOAL-Detail-Enhance-Plugin.md`. Adds
-      detail uniformly to the entire image, no selection boundary. ~30
-      lines of Python + a small Rust worker.
+Pending work for the LaMa inpainting GIMP plug-in. Format: `- [ ] <item>`.
 
 ## ORT dependency pinning
 
@@ -45,9 +29,7 @@ plus the file/place where it belongs.
 
 - [ ] **Plug-in icon / better menu organization.** Currently
       `Filters > Enhance > LaMa Inpaint...`. Once we add another
-      inpainter or the detail-enhance filter, consider a submenu or
-      labels.
-
+      inpainter, consider a submenu or labels.
 
 ## Cleanup (2026-08)
 
@@ -61,3 +43,13 @@ plus the file/place where it belongs.
 - [x] GitHub issue drafts ready at `oxionnx-0.1.4/GITHUB_ISSUE_pad_assertion.md` and `oxionnx-0.1.4/PAD_FIX_FINDINGS.md`
 - [x] `lama-worker-rs/OPTIMIZATION.md` updated with 2026-08 addendum (Moebius removed, OxiONNX benchmark done, ORT config locked at CPU baseline)
 - [x] LaMa worker confirmed on ORT CPU baseline — no `with_intra_threads`, no `with_parallel_execution`, no `OptLevel::All`
+- [x] Detail Enhance / DAT / Real-ESRGAN references removed from TODO.md —
+      not LaMa inpainting; those were deferred indefinitely and belong
+      to a separate project.
+
+## Done (v1.0.0)
+
+- [x] Manga LaMa model support via Rust candle sidecar
+- [x] Resolution-preserving inference (pad to /8, no squash to 512²)
+- [x] Model selection dropdown in GIMP dialog
+- [x] v1.0.0 release with zip + GH release
