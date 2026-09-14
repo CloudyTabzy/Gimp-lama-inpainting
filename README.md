@@ -96,13 +96,6 @@ advantage on every subsequent call, with no code changes to the
 GIMP integration — the Rust worker takes the same temp-PNG handoff
 as the Python one.
 
-> **See also:** the OxiONNX worker — a separate, pure-Rust engine with no
-> ONNX Runtime dependency — lives in its own repository:
-> <https://github.com/CloudyTabzy/LaMa-OxiONNX>. It installs side by side
-> with this plug-in (own menu entry, own folder) and runs the same model at
-> roughly **2× this plug-in's Rust worker** on the same machine with
-> output matching it to ≤1 LSB.
-
 ### What does what
 
 | Work | Time | Where |

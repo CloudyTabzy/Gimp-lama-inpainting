@@ -341,10 +341,7 @@ compile time stays under 5 s.
 
 ## Addendum: 2026-08
 
-The ORT CPU baseline is **the final answer** for the LaMa filter *within this
-plug-in* — superseded in 2026-09 for the LaMa use case by the sibling OxiONNX
-worker (see the update under finding 2 below); the ORT workers remain what
-this repository ships.
+The ORT CPU baseline is **the final answer** for the LaMa filter.
 Three findings from the recent work:
 
 1. **Moebius integration fully removed.** Originally added as a
@@ -361,15 +358,51 @@ Three findings from the recent work:
    upstream via the GitHub issue draft at
    `oxionnx-0.1.4/GITHUB_ISSUE_pad_assertion.md`. No further OxiONNX
    work — LaMa's use case is ORT.
+3. **ORT CPU EP config is locked.** All knobs known to hurt
+   performance are reverted:
+   - No `with_intra_threads(N)` (made 1.75 s → 4 s).
+   - No `commit_from_memory` for the model file (made 1.75 s →
+     3-5 s, inconsistent on Windows).
+   - No `with_parallel_execution(true)` (made 1.75 s → 2.07 s).
+   - `with_dimension_override("batch", 1)` is still set — this is
+     required, not a perf knob; ORT otherwise can't size the
+     dynamic dimension.
+   - The default ORT `OptLevel` (Basic) is in effect. `OptLevel::All`
+     was not tested but is not expected to help on a 198 MB model
+     already at the inference-time ceiling.
 
-   **(2026-09 update)** The upstream `Pad` issue was fixed (0.1.5/0.1.7,
-   plus a legacy-opset `Pad` repair in 0.1.8), and the pure-Rust path was
-   revisited in a dedicated repository:
-   <https://github.com/CloudyTabzy/LaMa-OxiONNX>. There the engine is
-   vendored, profiled and correctness-audited; it now runs LaMa at ~3.5 s
-   (512×512) versus this ORT worker's ~7.4 s, with output matching ONNX
-   Runtime to ≤1 LSB. This plug-in still ships the ORT workers — the
-   OxiONNX worker is an alternative in the sibling repository.
+**Practical conclusion:** the LaMa filter is at its perf ceiling on
+CPU with the current code. The only paths to faster inference are:
+
+- Smaller / distilled model (requires a new ONNX export — out of
+  scope of the current Rust work).
+- GPU acceleration that works on the target hardware (DirectML has
+  known ABI issues with some D3D12 runtimes; WebGPU/Dawn is
+  experimental; CUDA requires NVIDIA hardware).
+- A faster CPU (silicon, not software).
+
+None of these are in the scope of this codebase.
+
+
+## Addendum: 2026-08
+
+The ORT CPU baseline is **the final answer** for the LaMa filter.
+Three findings from the recent work:
+
+1. **Moebius integration fully removed.** Originally added as a
+   `Remove Object (Moebius, slow)...` filter in GIMP, but Moebius needs
+   ~6 GB of VRAM. The model hit `ID3D12Device::CreateCommittedResource`
+   failures mid-inference. The GIMP-side filter, the Moebius Rust
+   worker source (`moebius-worker-rs/`), all four Moebius ONNX
+   models, and the worker binary have all been deleted. LaMa is the
+   only filter in this plug-in.
+2. **OxiONNX benchmarked but not adopted.** Pure-Rust ONNX runtime
+   benchmarked at `benchmark-ort-vs-oxionnx/`. Result: ORT 2.07 s
+   (works), OxiONNX panics on `nn.ReflectionPad2d` exports.
+   The Pad bug was patched locally in `oxionnx-0.1.4/` and reported
+   upstream via the GitHub issue draft at
+   `oxionnx-0.1.4/GITHUB_ISSUE_pad_assertion.md`. No further OxiONNX
+   work — LaMa's use case is ORT.
 3. **ORT CPU EP config is locked.** All knobs known to hurt
    performance are reverted:
    - No `with_intra_threads(N)` (made 1.75 s → 4 s).
